@@ -48,6 +48,16 @@
 #include "ruby/ractor.h"
 #include "ruby_assert.h"
 #include "shape.h"
+
+/* SIMD optimizations for string operations on x86_64 */
+#include "internal/bits.h"  /* for ruby_swap64/ruby_swap32 */
+
+#if (defined(__x86_64__) || defined(_M_X64)) && defined(HAVE_X86INTRIN_H)
+# include <x86intrin.h>
+# if defined(__SSE2__) || defined(_M_X64)
+#  define HAVE_STRING_SIMD 1
+# endif
+#endif
 #include "vm_sync.h"
 #include "ruby/internal/attr/nonstring.h"
 
@@ -6864,6 +6874,45 @@ rb_str_bytesplice(int argc, VALUE *argv, VALUE str)
 }
 
 /*
+ * Reverse bytes in-place using chunk-at-a-time swapping.
+ * This is significantly faster than byte-by-byte for larger strings.
+ */
+static inline void
+str_reverse_bytes_inplace(char *ptr, long len)
+{
+    char *s = ptr;
+    char *e = ptr + len;
+
+    /* Process 8-byte chunks */
+    while (s + 8 <= e - 8) {
+        uint64_t front = *(uint64_t *)s;
+        uint64_t back = *(uint64_t *)(e - 8);
+        *(uint64_t *)s = ruby_swap64(back);
+        *(uint64_t *)(e - 8) = ruby_swap64(front);
+        s += 8;
+        e -= 8;
+    }
+
+    /* Process 4-byte chunks */
+    while (s + 4 <= e - 4) {
+        uint32_t front = *(uint32_t *)s;
+        uint32_t back = *(uint32_t *)(e - 4);
+        *(uint32_t *)s = ruby_swap32(back);
+        *(uint32_t *)(e - 4) = ruby_swap32(front);
+        s += 4;
+        e -= 4;
+    }
+
+    /* Process remaining bytes */
+    e--;
+    while (s < e) {
+        char c = *s;
+        *s++ = *e;
+        *e-- = c;
+    }
+}
+
+/*
  *  call-seq:
  *    reverse -> new_string
  *
@@ -6884,43 +6933,44 @@ rb_str_reverse(VALUE str)
     VALUE rev;
     char *s, *e, *p;
     int cr;
+    long len = RSTRING_LEN(str);
 
-    if (RSTRING_LEN(str) <= 1) return str_duplicate(rb_cString, str);
+    if (len <= 1) return str_duplicate(rb_cString, str);
     enc = STR_ENC_GET(str);
-    rev = rb_str_new(0, RSTRING_LEN(str));
+    rev = rb_str_new(0, len);
     s = RSTRING_PTR(str); e = RSTRING_END(str);
-    p = RSTRING_END(rev);
+    p = RSTRING_PTR(rev);
     cr = ENC_CODERANGE(str);
 
-    if (RSTRING_LEN(str) > 1) {
-        if (single_byte_optimizable(str)) {
-            while (s < e) {
-                *--p = *s++;
-            }
-        }
-        else if (cr == ENC_CODERANGE_VALID) {
-            while (s < e) {
-                int clen = rb_enc_fast_mbclen(s, e, enc);
+    if (single_byte_optimizable(str)) {
+        /* Copy then reverse in-place using chunked algorithm */
+        memcpy(p, s, len);
+        str_reverse_bytes_inplace(p, len);
+    }
+    else if (cr == ENC_CODERANGE_VALID) {
+        p = RSTRING_END(rev);
+        while (s < e) {
+            int clen = rb_enc_fast_mbclen(s, e, enc);
 
-                p -= clen;
-                memcpy(p, s, clen);
-                s += clen;
-            }
-        }
-        else {
-            cr = rb_enc_asciicompat(enc) ?
-                ENC_CODERANGE_7BIT : ENC_CODERANGE_VALID;
-            while (s < e) {
-                int clen = rb_enc_mbclen(s, e, enc);
-
-                if (clen > 1 || (*s & 0x80)) cr = ENC_CODERANGE_UNKNOWN;
-                p -= clen;
-                memcpy(p, s, clen);
-                s += clen;
-            }
+            p -= clen;
+            memcpy(p, s, clen);
+            s += clen;
         }
     }
-    STR_SET_LEN(rev, RSTRING_LEN(str));
+    else {
+        cr = rb_enc_asciicompat(enc) ?
+            ENC_CODERANGE_7BIT : ENC_CODERANGE_VALID;
+        p = RSTRING_END(rev);
+        while (s < e) {
+            int clen = rb_enc_mbclen(s, e, enc);
+
+            if (clen > 1 || (*s & 0x80)) cr = ENC_CODERANGE_UNKNOWN;
+            p -= clen;
+            memcpy(p, s, clen);
+            s += clen;
+        }
+    }
+    STR_SET_LEN(rev, len);
     str_enc_copy_direct(rev, str);
     ENC_CODERANGE_SET(rev, cr);
 
@@ -6947,16 +6997,8 @@ rb_str_reverse_bang(VALUE str)
 {
     if (RSTRING_LEN(str) > 1) {
         if (single_byte_optimizable(str)) {
-            char *s, *e, c;
-
             str_modify_keep_cr(str);
-            s = RSTRING_PTR(str);
-            e = RSTRING_END(str) - 1;
-            while (s < e) {
-                c = *s;
-                *s++ = *e;
-                *e-- = c;
-            }
+            str_reverse_bytes_inplace(RSTRING_PTR(str), RSTRING_LEN(str));
         }
         else {
             str_shared_replace(str, rb_str_reverse(str));
