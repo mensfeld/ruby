@@ -78,11 +78,79 @@ const signed char ruby_digit36_to_number_table[] = {
 };
 
 NO_SANITIZE("unsigned-integer-overflow", extern unsigned long ruby_scan_digits(const char *str, ssize_t len, int base, size_t *retlen, int *overflow));
+
+/*
+ * Fast path for base 10: process 4 digits at a time using SWAR technique.
+ * This reduces the number of multiplications and provides better throughput.
+ */
+static inline unsigned long
+scan_digits_base10(const char *str, ssize_t len, size_t *retlen, int *overflow)
+{
+    const char *start = str;
+    const char *end = (len < 0) ? NULL : str + len;
+    unsigned long ret = 0;
+    unsigned long mul_overflow_4 = (~(unsigned long)0) / 10000;
+
+    *overflow = 0;
+
+    /* Process 4 digits at a time */
+    while ((end == NULL || str + 4 <= end)) {
+        /* Load 4 bytes */
+        unsigned int chunk;
+        memcpy(&chunk, str, 4);
+
+        /* Subtract '0' from each byte */
+        unsigned int sub0 = chunk - 0x30303030U;
+
+        /* Validate: check if any byte >= 10 or < 0 (non-digit) */
+        /* If (c - '0') > 9, the result will have high bits set */
+        unsigned int check_high = (chunk + 0x46464646U) & 0x80808080U;
+        unsigned int check_low = sub0 & 0x80808080U;
+
+        if (check_high || check_low) break;
+
+        /* Extract 4 digits and combine */
+        /* Little-endian: byte 0 is str[0], byte 3 is str[3] */
+        unsigned int d0 = (sub0 >> 0) & 0xFF;
+        unsigned int d1 = (sub0 >> 8) & 0xFF;
+        unsigned int d2 = (sub0 >> 16) & 0xFF;
+        unsigned int d3 = (sub0 >> 24) & 0xFF;
+
+        unsigned long val = d0 * 1000 + d1 * 100 + d2 * 10 + d3;
+
+        if (mul_overflow_4 < ret) *overflow = 1;
+        unsigned long old = ret;
+        ret = ret * 10000 + val;
+        if (ret < old) *overflow = 1;
+
+        str += 4;
+    }
+
+    /* Scalar remainder */
+    while (end == NULL || str < end) {
+        int d = ruby_digit36_to_number_table[(unsigned char)*str];
+        if (d < 0 || d >= 10) break;
+        if ((~(unsigned long)0) / 10 < ret) *overflow = 1;
+        unsigned long old = ret;
+        ret = ret * 10 + d;
+        if (ret < old) *overflow = 1;
+        str++;
+    }
+
+    *retlen = str - start;
+    return ret;
+}
+
 unsigned long
 ruby_scan_digits(const char *str, ssize_t len, int base, size_t *retlen, int *overflow)
 {
     RBIMPL_ASSERT_OR_ASSUME(base >= 2);
     RBIMPL_ASSERT_OR_ASSUME(base <= 36);
+
+    /* Fast path for base 10 (most common case) */
+    if (base == 10) {
+        return scan_digits_base10(str, len, retlen, overflow);
+    }
 
     const char *start = str;
     unsigned long ret = 0, x;
