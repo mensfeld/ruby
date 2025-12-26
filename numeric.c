@@ -4024,6 +4024,22 @@ rb_int_uminus(VALUE num)
     }
 }
 
+/*
+ * Two-digit lookup table for fast decimal conversion.
+ * Each pair of characters represents digits 00-99.
+ */
+static const char digit_pairs[201] =
+    "00010203040506070809"
+    "10111213141516171819"
+    "20212223242526272829"
+    "30313233343536373839"
+    "40414243444546474849"
+    "50515253545556575859"
+    "60616263646566676869"
+    "70717273747576777879"
+    "80818283848586878889"
+    "90919293949596979899";
+
 VALUE
 rb_fix2str(VALUE x, int base)
 {
@@ -4056,9 +4072,31 @@ rb_fix2str(VALUE x, int base)
     else {
         u = val;
     }
-    do {
-        *--b = ruby_digitmap[(int)(u % base)];
-    } while (u /= base);
+
+    if (base == 10) {
+        /* Optimized path for base 10: process 2 digits at a time */
+        while (u >= 100) {
+            unsigned int idx = (unsigned int)(u % 100) * 2;
+            u /= 100;
+            *--b = digit_pairs[idx + 1];
+            *--b = digit_pairs[idx];
+        }
+        /* Handle last 1-2 digits */
+        if (u >= 10) {
+            unsigned int idx = (unsigned int)u * 2;
+            *--b = digit_pairs[idx + 1];
+            *--b = digit_pairs[idx];
+        }
+        else {
+            *--b = (char)('0' + u);
+        }
+    }
+    else {
+        do {
+            *--b = ruby_digitmap[(int)(u % base)];
+        } while (u /= base);
+    }
+
     if (neg) {
         *--b = '-';
     }
