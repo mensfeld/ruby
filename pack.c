@@ -16,6 +16,14 @@
 #include <float.h>
 #include <sys/types.h>
 
+/* SIMD support for Base64 encoding */
+#if defined(__x86_64__) || defined(_M_X64)
+# if defined(__SSSE3__) || defined(__AVX2__)
+#  include <immintrin.h>
+#  define HAVE_SIMD_BASE64 1
+# endif
+#endif
+
 #include "internal.h"
 #include "internal/array.h"
 #include "internal/bits.h"
@@ -851,6 +859,107 @@ static const char uu_table[] =
 static const char b64_table[] =
 "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
+#ifdef HAVE_SIMD_BASE64
+/*
+ * SSSE3-accelerated Base64 encoding.
+ * Based on aklomp/base64 implementation.
+ * Processes 12 bytes input -> 16 bytes output per iteration.
+ */
+
+/* Reshuffle input bytes for 6-bit extraction.
+ * Input bytes: [a0 a1 a2 | b0 b1 b2 | c0 c1 c2 | d0 d1 d2]
+ * Output: Each 32-bit lane arranged for bit extraction.
+ *
+ * Based on aklomp/base64 SSSE3 encoder.
+ */
+static inline __m128i
+b64_encode_ssse3_reshuffle(__m128i in)
+{
+    /* Reshuffle bytes so each 32-bit lane contains 3 bytes in the order
+     * needed for 6-bit extraction. Uses aklomp/base64 pattern.
+     * _mm_set_epi8 specifies bytes in reverse order (byte 15 first).
+     */
+    in = _mm_shuffle_epi8(in,
+        _mm_set_epi8(10, 11, 9, 10, 7, 8, 6, 7, 4, 5, 3, 4, 1, 2, 0, 1));
+
+    /* After shuffle, each 32-bit lane (little-endian) contains:
+     * [byte1, byte2, byte0, byte1] for the corresponding 3-byte group.
+     *
+     * Extract 6-bit values using multiply-add trick:
+     * For 3 input bytes A, B, C (arranged as [B, C, A, B] in lane):
+     *   idx0 = A >> 2
+     *   idx1 = ((A & 3) << 4) | (B >> 4)
+     *   idx2 = ((B & 15) << 2) | (C >> 6)
+     *   idx3 = C & 63
+     */
+    const __m128i t0 = _mm_and_si128(in, _mm_set1_epi32(0x0FC0FC00));
+    const __m128i t1 = _mm_mulhi_epu16(t0, _mm_set1_epi32(0x04000040));
+    const __m128i t2 = _mm_and_si128(in, _mm_set1_epi32(0x003F03F0));
+    const __m128i t3 = _mm_mullo_epi16(t2, _mm_set1_epi32(0x01000010));
+    return _mm_or_si128(t1, t3);
+}
+
+/* Translate 6-bit values (0-63) to Base64 ASCII characters.
+ * Uses a lookup table with range-based indexing. */
+static inline __m128i
+b64_encode_ssse3_translate(__m128i in)
+{
+    /* LUT for offset from 6-bit value to ASCII:
+     * 0-25  -> 'A'-'Z' (add 65)  offset = 65
+     * 26-51 -> 'a'-'z' (add 71)  offset = 71
+     * 52-61 -> '0'-'9' (add -4)  offset = -4
+     * 62    -> '+'     (add -19) offset = -19
+     * 63    -> '/'     (add -16) offset = -16
+     */
+    /* Compute saturated subtraction to determine range index */
+    __m128i result = _mm_subs_epu8(in, _mm_set1_epi8(51));
+
+    /* Compare with 25 to distinguish A-Z from a-z range */
+    __m128i less_than_26 = _mm_cmpgt_epi8(_mm_set1_epi8(26), in);
+
+    /* Adjust index: if < 26, use index 0; else use subtracted value + 1 */
+    result = _mm_or_si128(
+        _mm_and_si128(less_than_26, _mm_setzero_si128()),
+        _mm_andnot_si128(less_than_26, _mm_add_epi8(result, _mm_set1_epi8(1)))
+    );
+
+    /* Lookup table for offsets */
+    const __m128i lut = _mm_setr_epi8(
+        65,   /* 0: 0-25 -> 'A' (65) */
+        71,   /* 1: 26-51 -> 'a' (97-26=71) */
+        -4,   /* 2: 52 -> '0' (48-52=-4) */
+        -4, -4, -4, -4, -4, -4, -4,  /* 3-9: 53-59 -> '1'-'7' */
+        -4,   /* 10: 60 -> '8' */
+        -4,   /* 11: 61 -> '9' */
+        -19,  /* 12: 62 -> '+' (43-62=-19) */
+        -16,  /* 13: 63 -> '/' (47-63=-16) */
+        0, 0  /* padding */
+    );
+
+    __m128i offsets = _mm_shuffle_epi8(lut, result);
+    return _mm_add_epi8(in, offsets);
+}
+
+static long
+b64_encode_ssse3(char *dst, const unsigned char *src, long len)
+{
+    char *out = dst;
+
+    /* Process 12 bytes at a time -> 16 output bytes */
+    while (len >= 12) {
+        __m128i in = _mm_loadu_si128((const __m128i *)src);
+        __m128i reshuffled = b64_encode_ssse3_reshuffle(in);
+        __m128i translated = b64_encode_ssse3_translate(reshuffled);
+        _mm_storeu_si128((__m128i *)out, translated);
+        src += 12;
+        out += 16;
+        len -= 12;
+    }
+
+    return out - dst;
+}
+#endif /* HAVE_SIMD_BASE64 */
+
 static void
 encodes(VALUE str, const char *s0, long len, int type, int tail_lf)
 {
@@ -868,6 +977,32 @@ encodes(VALUE str, const char *s0, long len, int type, int tail_lf)
     else {
         padding = '=';
     }
+
+#ifdef HAVE_SIMD_BASE64
+    /* Use SIMD for base64 encoding of large blocks */
+    if (type == 'm' && len >= 48) {
+        /* Process in chunks that fit the buffer */
+        while (len >= 48) {
+            long chunk_len = len;
+            if (chunk_len > buff_size / 4 * 3 - 16) {
+                chunk_len = buff_size / 4 * 3 - 16;
+            }
+            /* Align to 12-byte boundary for SIMD */
+            chunk_len = chunk_len / 12 * 12;
+
+            long encoded = b64_encode_ssse3(buff + i, s, chunk_len);
+            i += encoded;
+            s += (encoded / 16) * 12;
+            len -= (encoded / 16) * 12;
+
+            if (i >= buff_size - 64) {
+                rb_str_buf_cat(str, buff, i);
+                i = 0;
+            }
+        }
+    }
+#endif
+
     while (len >= input_unit) {
         while (len >= input_unit && buff_size-i >= encoded_unit) {
             buff[i++] = trans[077 & (*s >> 2)];
