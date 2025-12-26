@@ -48,6 +48,16 @@
 #include "ruby/ractor.h"
 #include "ruby_assert.h"
 #include "shape.h"
+
+/* SIMD optimizations for string operations on x86_64 */
+#include "internal/bits.h"  /* for ruby_swap64/ruby_swap32 */
+
+#if (defined(__x86_64__) || defined(_M_X64)) && defined(HAVE_X86INTRIN_H)
+# include <x86intrin.h>
+# if defined(__SSE2__) || defined(_M_X64)
+#  define HAVE_STRING_SIMD 1
+# endif
+#endif
 #include "vm_sync.h"
 #include "ruby/internal/attr/nonstring.h"
 
@@ -7921,6 +7931,36 @@ upcase_single(VALUE str)
     char *s = RSTRING_PTR(str), *send = RSTRING_END(str);
     bool modified = false;
 
+#ifdef HAVE_STRING_SIMD
+    /* SSE2 SIMD path: process 16 bytes at a time */
+    if (send - s >= 16) {
+        const __m128i a_minus_1 = _mm_set1_epi8('a' - 1);
+        const __m128i z_plus_1 = _mm_set1_epi8('z' + 1);
+        const __m128i to_upper = _mm_set1_epi8('a' - 'A');
+
+        while (send - s >= 16) {
+            __m128i chunk = _mm_loadu_si128((const __m128i *)s);
+
+            /* Check if >= 'a' and <= 'z' */
+            __m128i ge_a = _mm_cmpgt_epi8(chunk, a_minus_1);
+            __m128i le_z = _mm_cmpgt_epi8(z_plus_1, chunk);
+            __m128i is_lower = _mm_and_si128(ge_a, le_z);
+
+            /* Check if any lowercase letters found */
+            int mask = _mm_movemask_epi8(is_lower);
+            if (mask) {
+                modified = true;
+                /* Subtract 32 only from lowercase letters */
+                __m128i to_sub = _mm_and_si128(is_lower, to_upper);
+                chunk = _mm_sub_epi8(chunk, to_sub);
+                _mm_storeu_si128((__m128i *)s, chunk);
+            }
+            s += 16;
+        }
+    }
+#endif
+
+    /* Scalar fallback for remaining bytes */
     while (s < send) {
         unsigned int c = *(unsigned char*)s;
 
@@ -8006,6 +8046,36 @@ downcase_single(VALUE str)
     char *s = RSTRING_PTR(str), *send = RSTRING_END(str);
     bool modified = false;
 
+#ifdef HAVE_STRING_SIMD
+    /* SSE2 SIMD path: process 16 bytes at a time */
+    if (send - s >= 16) {
+        const __m128i A_minus_1 = _mm_set1_epi8('A' - 1);
+        const __m128i Z_plus_1 = _mm_set1_epi8('Z' + 1);
+        const __m128i to_lower = _mm_set1_epi8('a' - 'A');
+
+        while (send - s >= 16) {
+            __m128i chunk = _mm_loadu_si128((const __m128i *)s);
+
+            /* Check if >= 'A' and <= 'Z' */
+            __m128i ge_A = _mm_cmpgt_epi8(chunk, A_minus_1);
+            __m128i le_Z = _mm_cmpgt_epi8(Z_plus_1, chunk);
+            __m128i is_upper = _mm_and_si128(ge_A, le_Z);
+
+            /* Check if any uppercase letters found */
+            int mask = _mm_movemask_epi8(is_upper);
+            if (mask) {
+                modified = true;
+                /* Add 32 only to uppercase letters */
+                __m128i to_add = _mm_and_si128(is_upper, to_lower);
+                chunk = _mm_add_epi8(chunk, to_add);
+                _mm_storeu_si128((__m128i *)s, chunk);
+            }
+            s += 16;
+        }
+    }
+#endif
+
+    /* Scalar fallback for remaining bytes */
     while (s < send) {
         unsigned int c = *(unsigned char*)s;
 
