@@ -5650,13 +5650,70 @@ rb_int_bit_length(VALUE num)
     return Qnil;
 }
 
+/* Count the number of digits in base 10 using a fast lookup */
+static inline long
+fix_digits_count_base10(unsigned long x)
+{
+    /* Powers of 10 table for fast digit counting */
+    static const unsigned long pow10[] = {
+        1UL, 10UL, 100UL, 1000UL, 10000UL, 100000UL, 1000000UL,
+        10000000UL, 100000000UL, 1000000000UL,
+#if SIZEOF_LONG >= 8
+        10000000000UL, 100000000000UL, 1000000000000UL,
+        10000000000000UL, 100000000000000UL, 1000000000000000UL,
+        10000000000000000UL, 100000000000000000UL, 1000000000000000000UL,
+        10000000000000000000UL
+#endif
+    };
+    static const int max_idx = sizeof(pow10) / sizeof(pow10[0]) - 1;
+
+    /* Binary search for the digit count */
+    int lo = 0, hi = max_idx;
+    while (lo < hi) {
+        int mid = (lo + hi + 1) / 2;
+        if (x >= pow10[mid]) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return lo + 1;
+}
+
+/* Count the number of digits in base for pre-allocation */
+static inline long
+fix_digits_count(unsigned long x, long base)
+{
+    long count = 1;
+    while (x >= (unsigned long)base) {
+        count++;
+        x /= base;
+    }
+    return count;
+}
+
+/* Check if base is a power of 2 and return log2(base), or 0 if not */
+static inline int
+base_log2(long base)
+{
+    if (base > 0 && (base & (base - 1)) == 0) {
+        /* base is a power of 2 */
+        int log2 = 0;
+        while ((1L << log2) < base) log2++;
+        return log2;
+    }
+    return 0;
+}
+
 static VALUE
 rb_fix_digits(VALUE fix, long base)
 {
     VALUE digits;
-    long x = FIX2LONG(fix);
+    unsigned long x = (unsigned long)FIX2LONG(fix);
+    long count, i;
+    int log2;
 
-    RUBY_ASSERT(x >= 0);
+    RUBY_ASSERT(FIX2LONG(fix) >= 0);
 
     if (base < 2)
         rb_raise(rb_eArgError, "invalid radix %ld", base);
@@ -5664,13 +5721,51 @@ rb_fix_digits(VALUE fix, long base)
     if (x == 0)
         return rb_ary_new_from_args(1, INT2FIX(0));
 
-    digits = rb_ary_new();
-    while (x >= base) {
-        long q = x % base;
-        rb_ary_push(digits, LONG2NUM(q));
+    /* Optimized path for base 10: use fast counting and batch 2 digits */
+    if (base == 10) {
+        count = fix_digits_count_base10(x);
+        digits = rb_ary_new_capa(count);
+        i = 0;
+        while (x >= 100) {
+            long r = x % 100;
+            RARRAY_ASET(digits, i++, LONG2FIX(r % 10));
+            RARRAY_ASET(digits, i++, LONG2FIX(r / 10));
+            x /= 100;
+        }
+        if (x >= 10) {
+            RARRAY_ASET(digits, i++, LONG2FIX(x % 10));
+            RARRAY_ASET(digits, i++, LONG2FIX(x / 10));
+        } else {
+            RARRAY_ASET(digits, i++, LONG2FIX(x));
+        }
+        rb_ary_set_len(digits, count);
+        return digits;
+    }
+
+    /* Check for power-of-2 base optimization */
+    log2 = base_log2(base);
+    if (log2 > 0) {
+        /* Use bit count for power-of-2 bases */
+        int bits = sizeof(unsigned long) * 8 - __builtin_clzl(x);
+        count = (bits + log2 - 1) / log2;
+        digits = rb_ary_new_capa(count);
+        unsigned long mask = base - 1;
+        for (i = 0; i < count; i++) {
+            RARRAY_ASET(digits, i, LONG2FIX(x & mask));
+            x >>= log2;
+        }
+        rb_ary_set_len(digits, count);
+        return digits;
+    }
+
+    /* General case: pre-calculate count and use standard division */
+    count = fix_digits_count(x, base);
+    digits = rb_ary_new_capa(count);
+    for (i = 0; i < count; i++) {
+        RARRAY_ASET(digits, i, LONG2FIX(x % base));
         x /= base;
     }
-    rb_ary_push(digits, LONG2NUM(x));
+    rb_ary_set_len(digits, count);
 
     return digits;
 }
