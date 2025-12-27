@@ -136,6 +136,10 @@ VALUE rb_cSymbol;
 #define STR_NOFREE FL_USER18
 #define STR_FAKESTR FL_USER19
 
+/* Cached single-character strings for ASCII 0-127, indexed by encoding */
+#define ASCII_CHAR_CACHE_SIZE 128
+static VALUE rb_ascii_char_cache[3][ASCII_CHAR_CACHE_SIZE];  /* 0=ASCII-8BIT, 1=UTF-8, 2=US-ASCII */
+
 #define STR_SET_NOEMBED(str) do {\
     FL_SET((str), STR_NOEMBED);\
     FL_UNSET((str), STR_SHARED | STR_SHARED_ROOT | STR_BORROWED);\
@@ -9655,6 +9659,16 @@ rb_str_each_char_size(VALUE str, VALUE args, VALUE eobj)
     return rb_str_length(str);
 }
 
+static inline VALUE
+get_cached_ascii_char(int enc_idx, unsigned char c)
+{
+    /* Only cache for the 3 common encodings and ASCII range */
+    if (enc_idx <= ENCINDEX_US_ASCII && c < ASCII_CHAR_CACHE_SIZE) {
+        return rb_ascii_char_cache[enc_idx][c];
+    }
+    return Qnil;
+}
+
 static VALUE
 rb_str_enumerate_chars(VALUE str, VALUE ary)
 {
@@ -9662,21 +9676,39 @@ rb_str_enumerate_chars(VALUE str, VALUE ary)
     long i, len, n;
     const char *ptr;
     rb_encoding *enc;
+    int enc_idx;
 
     str = rb_str_new_frozen(str);
     ptr = RSTRING_PTR(str);
     len = RSTRING_LEN(str);
     enc = rb_enc_get(str);
+    enc_idx = rb_enc_to_index(enc);
 
     if (ENC_CODERANGE_CLEAN_P(ENC_CODERANGE(str))) {
         for (i = 0; i < len; i += n) {
             n = rb_enc_fast_mbclen(ptr + i, ptr + len, enc);
+            if (n == 1) {
+                unsigned char c = (unsigned char)ptr[i];
+                VALUE cached = get_cached_ascii_char(enc_idx, c);
+                if (!NIL_P(cached)) {
+                    ENUM_ELEM(ary, cached);
+                    continue;
+                }
+            }
             ENUM_ELEM(ary, rb_str_subseq(str, i, n));
         }
     }
     else {
         for (i = 0; i < len; i += n) {
             n = rb_enc_mbclen(ptr + i, ptr + len, enc);
+            if (n == 1) {
+                unsigned char c = (unsigned char)ptr[i];
+                VALUE cached = get_cached_ascii_char(enc_idx, c);
+                if (!NIL_P(cached)) {
+                    ENUM_ELEM(ary, cached);
+                    continue;
+                }
+            }
             ENUM_ELEM(ary, rb_str_subseq(str, i, n));
         }
     }
@@ -12930,6 +12962,28 @@ Init_String(void)
     rb_define_hooked_variable("$;", &rb_fs, 0, rb_fs_setter);
     rb_define_hooked_variable("$-F", &rb_fs, 0, rb_fs_setter);
     rb_gc_register_address(&rb_fs);
+
+    /* Initialize single-character string cache for ASCII 0-127 */
+    {
+        static const rb_encoding *encs[3];
+        char buf[2] = {0, 0};
+        int enc_idx;
+
+        encs[ENCINDEX_ASCII_8BIT] = rb_ascii8bit_encoding();
+        encs[ENCINDEX_UTF_8] = rb_utf8_encoding();
+        encs[ENCINDEX_US_ASCII] = rb_usascii_encoding();
+
+        for (enc_idx = 0; enc_idx < 3; enc_idx++) {
+            for (int c = 0; c < ASCII_CHAR_CACHE_SIZE; c++) {
+                VALUE str;
+                buf[0] = (char)c;
+                str = rb_enc_str_new(buf, 1, encs[enc_idx]);
+                str = rb_fstring(str);
+                rb_vm_register_global_object(str);
+                rb_ascii_char_cache[enc_idx][c] = str;
+            }
+        }
+    }
 
     rb_cSymbol = rb_define_class("Symbol", rb_cObject);
     rb_include_module(rb_cSymbol, rb_mComparable);
