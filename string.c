@@ -9608,14 +9608,24 @@ static VALUE
 rb_str_enumerate_bytes(VALUE str, VALUE ary)
 {
     long i;
+    long len = RSTRING_LEN(str);
+    const unsigned char *ptr = (const unsigned char *)RSTRING_PTR(str);
 
-    for (i=0; i<RSTRING_LEN(str); i++) {
-        ENUM_ELEM(ary, INT2FIX((unsigned char)RSTRING_PTR(str)[i]));
-    }
-    if (ary)
+    if (ary) {
+        /* Fast path: pre-allocated array, fill directly */
+        for (i = 0; i < len; i++) {
+            RARRAY_ASET(ary, i, INT2FIX(ptr[i]));
+        }
+        rb_ary_set_len(ary, len);
         return ary;
-    else
+    }
+    else {
+        /* Block form: yield each byte */
+        for (i = 0; i < len; i++) {
+            rb_yield(INT2FIX(ptr[i]));
+        }
         return str;
+    }
 }
 
 /*
