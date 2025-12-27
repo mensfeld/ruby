@@ -48,6 +48,16 @@
 #include "ruby/ractor.h"
 #include "ruby_assert.h"
 #include "shape.h"
+
+/* SIMD optimizations for string operations on x86_64 */
+#include "internal/bits.h"  /* for ruby_swap64/ruby_swap32 */
+
+#if (defined(__x86_64__) || defined(_M_X64)) && defined(HAVE_X86INTRIN_H)
+# include <x86intrin.h>
+# if defined(__SSE2__) || defined(_M_X64)
+#  define HAVE_STRING_SIMD 1
+# endif
+#endif
 #include "vm_sync.h"
 #include "ruby/internal/attr/nonstring.h"
 
@@ -9608,14 +9618,24 @@ static VALUE
 rb_str_enumerate_bytes(VALUE str, VALUE ary)
 {
     long i;
+    long len = RSTRING_LEN(str);
+    const unsigned char *ptr = (const unsigned char *)RSTRING_PTR(str);
 
-    for (i=0; i<RSTRING_LEN(str); i++) {
-        ENUM_ELEM(ary, INT2FIX((unsigned char)RSTRING_PTR(str)[i]));
-    }
-    if (ary)
+    if (ary) {
+        /* Fast path: pre-allocated array, fill directly */
+        for (i = 0; i < len; i++) {
+            RARRAY_ASET(ary, i, INT2FIX(ptr[i]));
+        }
+        rb_ary_set_len(ary, len);
         return ary;
-    else
+    }
+    else {
+        /* Block form: yield each byte */
+        for (i = 0; i < len; i++) {
+            rb_yield(INT2FIX(ptr[i]));
+        }
         return str;
+    }
 }
 
 /*
