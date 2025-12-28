@@ -5544,7 +5544,30 @@ recursive_cmp(VALUE ary1, VALUE ary2, int recur)
     }
     for (i=0; i<len; i++) {
         VALUE e1 = rb_ary_elt(ary1, i), e2 = rb_ary_elt(ary2, i);
-        VALUE v = rb_funcallv(e1, id_cmp, 1, &e2);
+        VALUE v;
+
+        /* Fast path for fixnum comparison */
+        if (FIXNUM_P(e1) && FIXNUM_P(e2) && CMP_OPTIMIZABLE(INTEGER)) {
+            if ((long)e1 > (long)e2) return INT2FIX(1);
+            if ((long)e1 < (long)e2) return INT2FIX(-1);
+            continue;
+        }
+
+        /* Fast path for string comparison */
+        if (STRING_P(e1) && STRING_P(e2) && CMP_OPTIMIZABLE(STRING)) {
+            int cmp = rb_str_cmp(e1, e2);
+            if (cmp != 0) return INT2FIX(cmp > 0 ? 1 : -1);
+            continue;
+        }
+
+        /* Fast path for float comparison */
+        if (RB_FLOAT_TYPE_P(e1) && RB_FLOAT_TYPE_P(e2) && CMP_OPTIMIZABLE(FLOAT)) {
+            int cmp = rb_float_cmp(e1, e2);
+            if (cmp != 0) return INT2FIX(cmp > 0 ? 1 : -1);
+            continue;
+        }
+
+        v = rb_funcallv(e1, id_cmp, 1, &e2);
         if (v != INT2FIX(0)) {
             return v;
         }
