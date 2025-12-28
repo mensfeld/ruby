@@ -1773,6 +1773,34 @@ flo_le(VALUE x, VALUE y)
 
 /*
  *  call-seq:
+ *    between?(min, max) -> true or false
+ *
+ *  Returns +true+ if +self+ is in <tt>min..max</tt>, +false+ otherwise:
+ *
+ *    3.14.between?(1.0, 5.0)   # => true
+ *    3.14.between?(4.0, 5.0)   # => false
+ *
+ */
+
+static VALUE
+flo_between_p(VALUE x, VALUE min, VALUE max)
+{
+    double a = RFLOAT_VALUE(x);
+
+    /* Fast path: all floats */
+    if (RB_FLOAT_TYPE_P(min) && RB_FLOAT_TYPE_P(max)) {
+        double min_v = RFLOAT_VALUE(min);
+        double max_v = RFLOAT_VALUE(max);
+        return RBOOL(a >= min_v && a <= max_v);
+    }
+
+    /* Mixed types: use existing comparison functions */
+    if (flo_ge(x, min) == Qfalse) return Qfalse;
+    return flo_le(x, max);
+}
+
+/*
+ *  call-seq:
  *    eql?(other) -> true or false
  *
  *  Returns +true+ if +other+ is a \Float with the same value as +self+,
@@ -5108,6 +5136,40 @@ int_le(VALUE x, VALUE y)
     return Qnil;
 }
 
+/*
+ *  call-seq:
+ *    between?(min, max) -> true or false
+ *
+ *  Returns +true+ if +self+ is in <tt>min..max</tt>, +false+ otherwise:
+ *
+ *    12.between?(1, 10)    # => false
+ *    1.between?(1, 10)     # => true
+ *    4.between?(1, 10)     # => true
+ *    10.between?(1, 10)    # => true
+ *
+ */
+
+static VALUE
+int_between_p(VALUE x, VALUE min, VALUE max)
+{
+    if (FIXNUM_P(x)) {
+        /* Fast path: all fixnums */
+        if (FIXNUM_P(min) && FIXNUM_P(max)) {
+            long xv = FIX2LONG(x);
+            return RBOOL(xv >= FIX2LONG(min) && xv <= FIX2LONG(max));
+        }
+        /* Mixed types: use existing comparison functions */
+        if (fix_ge(x, min) == Qfalse) return Qfalse;
+        return fix_le(x, max);
+    }
+    else if (RB_BIGNUM_TYPE_P(x)) {
+        if (rb_big_ge(x, min) == Qfalse) return Qfalse;
+        return rb_big_le(x, max);
+    }
+    /* Fallback to Comparable#between? */
+    return rb_call_super(2, (VALUE[]){min, max});
+}
+
 static VALUE
 fix_comp(VALUE num)
 {
@@ -6518,6 +6580,7 @@ Init_Numeric(void)
     rb_define_method(rb_cInteger, ">=", rb_int_ge, 1);
     rb_define_method(rb_cInteger, "<", int_lt, 1);
     rb_define_method(rb_cInteger, "<=", int_le, 1);
+    rb_define_method(rb_cInteger, "between?", int_between_p, 2);
 
     rb_define_method(rb_cInteger, "&", rb_int_and, 1);
     rb_define_method(rb_cInteger, "|", int_or,  1);
@@ -6655,6 +6718,7 @@ Init_Numeric(void)
     rb_define_method(rb_cFloat, ">=", flo_ge, 1);
     rb_define_method(rb_cFloat, "<",  flo_lt, 1);
     rb_define_method(rb_cFloat, "<=", flo_le, 1);
+    rb_define_method(rb_cFloat, "between?", flo_between_p, 2);
     rb_define_method(rb_cFloat, "eql?", flo_eql, 1);
     rb_define_method(rb_cFloat, "hash", flo_hash, 0);
 
