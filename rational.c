@@ -26,6 +26,7 @@
 #include "id.h"
 #include "internal.h"
 #include "internal/array.h"
+#include "internal/bits.h"
 #include "internal/complex.h"
 #include "internal/gc.h"
 #include "internal/numeric.h"
@@ -297,7 +298,7 @@ rb_gcd_gmp(VALUE x, VALUE y)
 inline static long
 i_gcd(long x, long y)
 {
-    unsigned long u, v, t;
+    unsigned long u, v;
     int shift;
 
     if (x < 0)
@@ -312,24 +313,27 @@ i_gcd(long x, long y)
 
     u = (unsigned long)x;
     v = (unsigned long)y;
-    for (shift = 0; ((u | v) & 1) == 0; ++shift) {
-        u >>= 1;
-        v >>= 1;
-    }
 
-    while ((u & 1) == 0)
-        u >>= 1;
+    /* Use CTZ (count trailing zeros) to efficiently find and remove
+     * common factors of 2. This replaces bit-by-bit loops with
+     * single CPU instructions on modern processors. */
+    int u_tz = ntz_intptr(u);
+    int v_tz = ntz_intptr(v);
+    shift = (u_tz < v_tz) ? u_tz : v_tz;
+    u >>= u_tz;
+    v >>= v_tz;
 
+    /* Binary GCD main loop - both u and v are now odd */
     do {
-        while ((v & 1) == 0)
-            v >>= 1;
-
         if (u > v) {
-            t = v;
+            unsigned long t = v;
             v = u;
             u = t;
         }
         v = v - u;
+        if (v != 0) {
+            v >>= ntz_intptr(v);
+        }
     } while (v != 0);
 
     return (long)(u << shift);
