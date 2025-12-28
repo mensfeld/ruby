@@ -1773,6 +1773,41 @@ flo_le(VALUE x, VALUE y)
 
 /*
  *  call-seq:
+ *    clamp(min, max) -> float
+ *    clamp(range) -> float
+ *
+ *  Returns +min+ if +self+ is less than +min+, +max+ if +self+ is greater
+ *  than +max+, otherwise +self+:
+ *
+ *    3.14.clamp(0.0, 5.0)  # => 3.14
+ *    -1.0.clamp(0.0, 5.0)  # => 0.0
+ *    10.0.clamp(0.0, 5.0)  # => 5.0
+ *
+ */
+
+static VALUE
+flo_clamp(int argc, VALUE *argv, VALUE x)
+{
+    /* Fast path: two float arguments */
+    if (argc == 2 && RB_FLOAT_TYPE_P(argv[0]) && RB_FLOAT_TYPE_P(argv[1])) {
+        double xv = RFLOAT_VALUE(x);
+        double minv = RFLOAT_VALUE(argv[0]);
+        double maxv = RFLOAT_VALUE(argv[1]);
+
+        if (minv > maxv) {
+            rb_raise(rb_eArgError, "min argument must be less than or equal to max argument");
+        }
+        if (xv < minv) return argv[0];
+        if (xv > maxv) return argv[1];
+        return x;
+    }
+
+    /* Fall back to Comparable#clamp for complex cases */
+    return rb_call_super(argc, argv);
+}
+
+/*
+ *  call-seq:
  *    eql?(other) -> true or false
  *
  *  Returns +true+ if +other+ is a \Float with the same value as +self+,
@@ -5108,6 +5143,41 @@ int_le(VALUE x, VALUE y)
     return Qnil;
 }
 
+/*
+ *  call-seq:
+ *    clamp(min, max) -> integer
+ *    clamp(range) -> integer
+ *
+ *  Returns +min+ if +self+ is less than +min+, +max+ if +self+ is greater
+ *  than +max+, otherwise +self+:
+ *
+ *    12.clamp(0, 100)  # => 12
+ *    -3.clamp(0, 100)  # => 0
+ *    523.clamp(0, 100) # => 100
+ *
+ */
+
+static VALUE
+int_clamp(int argc, VALUE *argv, VALUE x)
+{
+    /* Fast path: two fixnum arguments */
+    if (argc == 2 && FIXNUM_P(x) && FIXNUM_P(argv[0]) && FIXNUM_P(argv[1])) {
+        long xv = FIX2LONG(x);
+        long minv = FIX2LONG(argv[0]);
+        long maxv = FIX2LONG(argv[1]);
+
+        if (minv > maxv) {
+            rb_raise(rb_eArgError, "min argument must be less than or equal to max argument");
+        }
+        if (xv < minv) return argv[0];
+        if (xv > maxv) return argv[1];
+        return x;
+    }
+
+    /* Fall back to Comparable#clamp for complex cases */
+    return rb_call_super(argc, argv);
+}
+
 static VALUE
 fix_comp(VALUE num)
 {
@@ -6518,6 +6588,7 @@ Init_Numeric(void)
     rb_define_method(rb_cInteger, ">=", rb_int_ge, 1);
     rb_define_method(rb_cInteger, "<", int_lt, 1);
     rb_define_method(rb_cInteger, "<=", int_le, 1);
+    rb_define_method(rb_cInteger, "clamp", int_clamp, -1);
 
     rb_define_method(rb_cInteger, "&", rb_int_and, 1);
     rb_define_method(rb_cInteger, "|", int_or,  1);
@@ -6655,6 +6726,7 @@ Init_Numeric(void)
     rb_define_method(rb_cFloat, ">=", flo_ge, 1);
     rb_define_method(rb_cFloat, "<",  flo_lt, 1);
     rb_define_method(rb_cFloat, "<=", flo_le, 1);
+    rb_define_method(rb_cFloat, "clamp", flo_clamp, -1);
     rb_define_method(rb_cFloat, "eql?", flo_eql, 1);
     rb_define_method(rb_cFloat, "hash", flo_hash, 0);
 
