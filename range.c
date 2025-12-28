@@ -200,7 +200,28 @@ range_eq(VALUE range, VALUE obj)
 static int
 r_less(VALUE a, VALUE b)
 {
-    VALUE r = rb_funcall(a, id_cmp, 1, b);
+    VALUE r;
+
+    /* Fast path for fixnum-fixnum comparison */
+    if (FIXNUM_P(a) && FIXNUM_P(b)) {
+        long av = FIX2LONG(a);
+        long bv = FIX2LONG(b);
+        if (av < bv) return -1;
+        if (av > bv) return 1;
+        return 0;
+    }
+
+    /* Fast path for float-float comparison */
+    if (RB_FLOAT_TYPE_P(a) && RB_FLOAT_TYPE_P(b)) {
+        double av = RFLOAT_VALUE(a);
+        double bv = RFLOAT_VALUE(b);
+        if (isnan(av) || isnan(bv)) return INT_MAX;
+        if (av < bv) return -1;
+        if (av > bv) return 1;
+        return 0;
+    }
+
+    r = rb_funcall(a, id_cmp, 1, b);
 
     if (NIL_P(r))
         return INT_MAX;
