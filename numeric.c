@@ -5650,6 +5650,23 @@ rb_int_bit_length(VALUE num)
     return Qnil;
 }
 
+/* Two-digit lookup tables for base 10 digits extraction */
+static const unsigned char digits_ones[100] = {
+    0,1,2,3,4,5,6,7,8,9, 0,1,2,3,4,5,6,7,8,9,
+    0,1,2,3,4,5,6,7,8,9, 0,1,2,3,4,5,6,7,8,9,
+    0,1,2,3,4,5,6,7,8,9, 0,1,2,3,4,5,6,7,8,9,
+    0,1,2,3,4,5,6,7,8,9, 0,1,2,3,4,5,6,7,8,9,
+    0,1,2,3,4,5,6,7,8,9, 0,1,2,3,4,5,6,7,8,9
+};
+
+static const unsigned char digits_tens[100] = {
+    0,0,0,0,0,0,0,0,0,0, 1,1,1,1,1,1,1,1,1,1,
+    2,2,2,2,2,2,2,2,2,2, 3,3,3,3,3,3,3,3,3,3,
+    4,4,4,4,4,4,4,4,4,4, 5,5,5,5,5,5,5,5,5,5,
+    6,6,6,6,6,6,6,6,6,6, 7,7,7,7,7,7,7,7,7,7,
+    8,8,8,8,8,8,8,8,8,8, 9,9,9,9,9,9,9,9,9,9
+};
+
 static VALUE
 rb_fix_digits(VALUE fix, long base)
 {
@@ -5665,6 +5682,27 @@ rb_fix_digits(VALUE fix, long base)
         return rb_ary_new_from_args(1, INT2FIX(0));
 
     digits = rb_ary_new();
+
+    /* Fast path for base 10: process two digits at a time */
+    if (base == 10) {
+        while (x >= 100) {
+            long q = x % 100;
+            rb_ary_push(digits, INT2FIX(digits_ones[q]));
+            rb_ary_push(digits, INT2FIX(digits_tens[q]));
+            x /= 100;
+        }
+        /* Handle remaining 1-2 digits */
+        if (x >= 10) {
+            rb_ary_push(digits, INT2FIX(digits_ones[x]));
+            rb_ary_push(digits, INT2FIX(digits_tens[x]));
+        }
+        else {
+            rb_ary_push(digits, INT2FIX(x));
+        }
+        return digits;
+    }
+
+    /* General case for other bases */
     while (x >= base) {
         long q = x % base;
         rb_ary_push(digits, LONG2NUM(q));
