@@ -4420,10 +4420,12 @@ succ_index_table_invert(int max_pos, struct succ_index_table *sd, int size)
     }
     for (k = 0; k < succ_size; k++) {
         for (j = 0; j < 8; j++) {
-            for (i = 0; i < 64; i++) {
-                if (sd->succ_part[k].bits[j] & (((uint64_t)1) << i)) {
-                    *p++ = k * 512 + j * 64 + i + IMMEDIATE_TABLE_SIZE;
-                }
+            /* Use CTZ to skip directly to set bits instead of checking each bit */
+            uint64_t bits = sd->succ_part[k].bits[j];
+            while (bits) {
+                int bit_pos = ntz_int64(bits);
+                *p++ = k * 512 + j * 64 + bit_pos + IMMEDIATE_TABLE_SIZE;
+                bits &= bits - 1;  /* Clear lowest set bit */
             }
         }
     }
