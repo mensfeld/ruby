@@ -40,6 +40,9 @@
 #include "internal/re.h"
 #include "internal/sanitizers.h"
 #include "internal/simd.h"
+#if defined(__SSE2__)
+# include <emmintrin.h>
+#endif
 #include "internal/string.h"
 #include "internal/transcode.h"
 #include "probes.h"
@@ -4638,6 +4641,36 @@ str_casecmp(VALUE str1, VALUE str2)
     p1 = RSTRING_PTR(str1); p1end = RSTRING_END(str1);
     p2 = RSTRING_PTR(str2); p2end = RSTRING_END(str2);
     if (single_byte_optimizable(str1) && single_byte_optimizable(str2)) {
+#if defined(__SSE2__)
+        /* Block case-insensitive fast path for long single-byte strings:
+         * advance 16 bytes at a time while whole blocks are equal after
+         * ASCII case folding, then let the exact scalar loop below decide
+         * on the first differing block (same order, same result).
+         *
+         * ASCII tolower in SIMD: bytes in 0x41..0x5A get |= 0x20, all
+         * others pass through.  The range test uses signed compares, so
+         * high bytes (>= 0x80 appear negative) fail the > 0x40 test and
+         * pass through unchanged - exactly like TOLOWER(). */
+        {
+            const __m128i lo40 = _mm_set1_epi8(0x40);
+            const __m128i lo5B = _mm_set1_epi8(0x5B);
+            const __m128i sp20 = _mm_set1_epi8(0x20);
+            ptrdiff_t n1 = p1end - p1, n2 = p2end - p2;
+            ptrdiff_t n = n1 < n2 ? n1 : n2;
+            while (n >= 16) {
+                __m128i v1 = _mm_loadu_si128((const __m128i *)p1);
+                __m128i v2 = _mm_loadu_si128((const __m128i *)p2);
+                __m128i m1 = _mm_and_si128(_mm_and_si128(
+                    _mm_cmpgt_epi8(v1, lo40), _mm_cmplt_epi8(v1, lo5B)), sp20);
+                __m128i m2 = _mm_and_si128(_mm_and_si128(
+                    _mm_cmpgt_epi8(v2, lo40), _mm_cmplt_epi8(v2, lo5B)), sp20);
+                if (_mm_movemask_epi8(_mm_cmpeq_epi8(
+                        _mm_or_si128(v1, m1), _mm_or_si128(v2, m2))) != 0xFFFF)
+                    break;
+                p1 += 16; p2 += 16; n -= 16;
+            }
+        }
+#endif
         while (p1 < p1end && p2 < p2end) {
             if (*p1 != *p2) {
                 unsigned int c1 = TOLOWER(*p1 & 0xff);
@@ -4728,6 +4761,39 @@ str_casecmp_p(VALUE str1, VALUE str2)
         if (RSTRING_LEN(str1) != RSTRING_LEN(str2)) return Qfalse;
         const char *p1 = RSTRING_PTR(str1), *p1end = RSTRING_END(str1);
         const char *p2 = RSTRING_PTR(str2);
+#if defined(__SSE2__)
+        /* Case-insensitive equality 16 bytes at a time; fall back to the
+         * exact scalar check for blocks that differ after ASCII case
+         * folding (see str_casecmp for the range-test rationale). */
+        {
+            const __m128i lo40 = _mm_set1_epi8(0x40);
+            const __m128i lo5B = _mm_set1_epi8(0x5B);
+            const __m128i sp20 = _mm_set1_epi8(0x20);
+            ptrdiff_t n = p1end - p1;
+            while (n >= 16) {
+                __m128i v1 = _mm_loadu_si128((const __m128i *)p1);
+                __m128i v2 = _mm_loadu_si128((const __m128i *)p2);
+                __m128i m1 = _mm_and_si128(_mm_and_si128(
+                    _mm_cmpgt_epi8(v1, lo40), _mm_cmplt_epi8(v1, lo5B)), sp20);
+                __m128i m2 = _mm_and_si128(_mm_and_si128(
+                    _mm_cmpgt_epi8(v2, lo40), _mm_cmplt_epi8(v2, lo5B)), sp20);
+                if (_mm_movemask_epi8(_mm_cmpeq_epi8(
+                        _mm_or_si128(v1, m1), _mm_or_si128(v2, m2))) != 0xFFFF) {
+                    /* differing block: exact scalar check for these 16 bytes */
+                    const char *e = p1 + 16;
+                    for (; p1 < e; p1++, p2++) {
+                        if (*p1 != *p2 && TOLOWER((unsigned char)*p1) != TOLOWER((unsigned char)*p2)) {
+                            return Qfalse;
+                        }
+                    }
+                }
+                else {
+                    p1 += 16; p2 += 16;
+                }
+                n -= 16;
+            }
+        }
+#endif
         while (p1 < p1end) {
             if (*p1 != *p2 && TOLOWER((unsigned char)*p1) != TOLOWER((unsigned char)*p2)) {
                 return Qfalse;
