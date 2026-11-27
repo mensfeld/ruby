@@ -1165,6 +1165,84 @@ class TC_Set < Test::Unit::TestCase
     end
   end
 
+
+  def test_min_max_minmax
+    ALL_SET_CLASSES.each do |klass|
+      assert_nil(klass[].min)
+      assert_nil(klass[].max)
+      assert_equal([nil, nil], klass[].minmax)
+
+      set = klass[3, 1, 2]
+      assert_equal(1, set.min)
+      assert_equal(3, set.max)
+      assert_equal([1, 3], set.minmax)
+
+      assert_equal([1, 2], set.min(2))
+      assert_equal([3, 2], set.max(2))
+      assert_equal(3, set.min { |a, b| b <=> a })
+      assert_equal(1, set.max { |a, b| b <=> a })
+      assert_equal([3, 1], set.minmax { |a, b| b <=> a })
+
+      # adding new bounds updates the cached values
+      set << 0
+      assert_equal(0, set.min)
+      assert_equal(3, set.max)
+
+      # deleting the bounds recomputes them
+      set.delete(0)
+      assert_equal(1, set.min)
+      set.delete(1)
+      assert_equal(2, set.min)
+      set.delete(3)
+      assert_equal(2, set.min)
+      assert_equal(2, set.max)
+      set.delete(2)
+      assert_nil(set.min)
+      assert_nil(set.max)
+      set.clear
+      assert_nil(set.min)
+      assert_nil(set.max)
+    end
+  end
+
+  def test_min_max_bound_recomputation
+    ALL_SET_CLASSES.each do |klass|
+      set = klass[]
+      set << 1.5
+      set << 2
+      assert_equal(1.5, set.min)
+      assert_equal(2, set.max)
+      set << -3
+      assert_equal(-3, set.min)
+      assert_equal(2, set.max)
+      set.delete(1.5)
+      assert_equal(-3, set.min)
+      assert_equal(2, set.max)
+
+      set = klass[1, 2, 3]
+      set.replace([0])
+      assert_equal([0, 0], set.minmax)
+      set.merge(4..6)
+      assert_equal([0, 6], set.minmax)
+      set.subtract(5..6)
+      assert_equal(0, set.min)
+      assert_equal(4, set.max)
+
+      set = klass[1, 2, 3]
+      set.keep_if { |x| x < 3 }
+      assert_equal(1, set.min)
+      assert_equal(2, set.max)
+    end
+  end
+
+  def test_min_max_incomparable_elements
+    ALL_SET_CLASSES.each do |klass|
+      set = klass[1, "a"]
+      assert_raise(ArgumentError) { set.min }
+      assert_raise(ArgumentError) { set.max }
+      assert_raise(ArgumentError) { set.minmax }
+    end
+  end
 end
 
 class TC_Enumerable < Test::Unit::TestCase
@@ -1213,6 +1291,7 @@ class TC_Enumerable < Test::Unit::TestCase
     assert(set.is_a?(Set))
     assert_equal(Set[1,2,3], set)
   end
+
 end
 
 class TC_Set_Builtin < Test::Unit::TestCase

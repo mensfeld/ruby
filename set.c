@@ -107,6 +107,7 @@ static ID id_i_hash;
 static ID id_set_iter_lev;
 static ID id_subclass_compatible;
 static ID id_class_methods;
+static ID id_cmp;
 
 #define RSET_INITIALIZED FL_USER1
 #define RSET_LEV_MASK (FL_USER13 | FL_USER14 | FL_USER15 |                /* FL 13..19 */ \
@@ -124,6 +125,10 @@ static ID id_class_methods;
 
 struct set_object {
     set_table table;
+    VALUE min;
+    VALUE max;
+    unsigned int min_valid:1;
+    unsigned int max_valid:1;
 };
 
 static int
@@ -146,6 +151,8 @@ static void
 set_mark(void *ptr)
 {
     struct set_object *sobj = ptr;
+    rb_gc_mark_movable(sobj->min);
+    rb_gc_mark_movable(sobj->max);
     if (sobj->table.entries) {
         if (sobj->table.type == &identhash) {
             set_table_foreach(&sobj->table, mark_and_pin_key, 0);
@@ -193,6 +200,8 @@ static void
 set_update_references(void *ptr)
 {
     struct set_object *sobj = ptr;
+    rb_gc_mark_and_move(&sobj->min);
+    rb_gc_mark_and_move(&sobj->max);
     set_foreach_with_replace(&sobj->table, set_foreach_replace, set_replace_ref, 0);
 }
 
@@ -379,6 +388,243 @@ set_compact_after_delete(VALUE set)
     }
 }
 
+static void
+set_bound_invalidate(struct set_object *sobj)
+{
+    sobj->min = Qnil;
+    sobj->max = Qnil;
+    sobj->min_valid = 0;
+    sobj->max_valid = 0;
+}
+
+/*
+ * Maintain the cached bounds after a successful insertion.
+ *
+ * A valid bound is always a member of the set.  When both the cached
+ * bound and the inserted key are Fixnums the bound can be updated in
+ * O(1) without calling into #<=>.  Any other combination falls back
+ * to recomputing the bounds lazily in #min/#max.
+ */
+static void
+set_bound_on_insert(VALUE set, VALUE key)
+{
+    struct set_object *sobj;
+    TypedData_Get_Struct(set, struct set_object, &set_data_type, sobj);
+
+    if (RB_OBJ_FROZEN(set)) {
+        return;
+    }
+
+    if (set_table_size(&sobj->table) <= 1) {
+        sobj->min = key;
+        sobj->max = key;
+        sobj->min_valid = 1;
+        sobj->max_valid = 1;
+        return;
+    }
+
+    if (RB_FIXNUM_P(key)) {
+        if (sobj->min_valid) {
+            if (RB_FIXNUM_P(sobj->min)) {
+                if ((SIGNED_VALUE)key < (SIGNED_VALUE)sobj->min) {
+                    sobj->min = key;
+                }
+            }
+            else {
+                /* Mixed types: drop the bound and let #min recompute. */
+                sobj->min = Qnil;
+                sobj->min_valid = 0;
+            }
+        }
+        if (sobj->max_valid) {
+            if (RB_FIXNUM_P(sobj->max)) {
+                if ((SIGNED_VALUE)key > (SIGNED_VALUE)sobj->max) {
+                    sobj->max = key;
+                }
+            }
+            else {
+                sobj->max = Qnil;
+                sobj->max_valid = 0;
+            }
+        }
+    }
+    else {
+        set_bound_invalidate(sobj);
+    }
+}
+
+/*
+ * Invalidate a cached bound that is no longer a member of the set
+ * (e.g. it was deleted).  Membership probing is O(1), the expensive
+ * rescan stays lazy: it happens in #min/#max.
+ */
+static void
+set_bounds_revalidate(VALUE set)
+{
+    struct set_object *sobj;
+    TypedData_Get_Struct(set, struct set_object, &set_data_type, sobj);
+
+    if (RB_OBJ_FROZEN(set)) {
+        return;
+    }
+
+    if (sobj->min_valid &&
+            !set_table_lookup(&sobj->table, (st_data_t)sobj->min)) {
+        sobj->min = Qnil;
+        sobj->min_valid = 0;
+    }
+    if (sobj->max_valid &&
+            !set_table_lookup(&sobj->table, (st_data_t)sobj->max)) {
+        sobj->max = Qnil;
+        sobj->max_valid = 0;
+    }
+}
+
+struct set_bound_scan {
+    VALUE min;
+    VALUE max;
+    int empty;
+};
+
+static int
+set_bound_scan_i(st_data_t key, st_data_t data)
+{
+    struct set_bound_scan *scan = (struct set_bound_scan *)data;
+    VALUE v = (VALUE)key;
+
+    if (scan->empty) {
+        scan->min = v;
+        scan->max = v;
+        scan->empty = 0;
+        return ST_CONTINUE;
+    }
+
+    if (rb_cmpint(rb_funcall(v, id_cmp, 1, scan->min), v, scan->min) < 0) {
+        scan->min = v;
+    }
+    if (rb_cmpint(rb_funcall(v, id_cmp, 1, scan->max), v, scan->max) > 0) {
+        scan->max = v;
+    }
+
+    return ST_CONTINUE;
+}
+
+/* Scan the set once, cache both bounds and return them. */
+static struct set_bound_scan
+set_bounds_update(VALUE set)
+{
+    struct set_object *sobj;
+    TypedData_Get_Struct(set, struct set_object, &set_data_type, sobj);
+
+    struct set_bound_scan scan = { Qnil, Qnil, 1 };
+    set_iter(set, set_bound_scan_i, (st_data_t)&scan);
+
+    if (scan.empty) {
+        set_bound_invalidate(sobj);
+    }
+    else if (!RB_OBJ_FROZEN(set)) {
+        sobj->min = scan.min;
+        sobj->max = scan.max;
+        sobj->min_valid = 1;
+        sobj->max_valid = 1;
+    }
+
+    return scan;
+}
+
+/*
+ *  call-seq:
+ *    min -> object or nil
+ *    min(n) -> array
+ *    min { |a, b| block } -> object or nil
+ *
+ *  Returns the minimum element of +self+ according to #<=>, or +nil+
+ *  if the set is empty.  The result is cached: repeated calls without
+ *  intervening mutation are O(1).  With a block or an argument, the
+ *  semantics are identical to Enumerable#min.
+ *
+ *    Set[2, 9, 1].min # => 1
+ */
+static VALUE
+set_i_min(int argc, VALUE *argv, VALUE set)
+{
+    struct set_object *sobj;
+    TypedData_Get_Struct(set, struct set_object, &set_data_type, sobj);
+
+    if (argc == 0 && !rb_block_given_p()) {
+        if (sobj->min_valid) {
+            return sobj->min;
+        }
+        struct set_bound_scan scan = set_bounds_update(set);
+        return scan.empty ? Qnil : scan.min;
+    }
+
+    return rb_call_super(argc, argv);
+}
+
+/*
+ *  call-seq:
+ *    max -> object or nil
+ *    max(n) -> array
+ *    max { |a, b| block } -> object or nil
+ *
+ *  Returns the maximum element of +self+ according to #<=>, or +nil+
+ *  if the set is empty.  The result is cached: repeated calls without
+ *  intervening mutation are O(1).  With a block or an argument, the
+ *  semantics are identical to Enumerable#max.
+ *
+ *    Set[2, 9, 1].max # => 9
+ */
+static VALUE
+set_i_max(int argc, VALUE *argv, VALUE set)
+{
+    struct set_object *sobj;
+    TypedData_Get_Struct(set, struct set_object, &set_data_type, sobj);
+
+    if (argc == 0 && !rb_block_given_p()) {
+        if (sobj->max_valid) {
+            return sobj->max;
+        }
+        struct set_bound_scan scan = set_bounds_update(set);
+        return scan.empty ? Qnil : scan.max;
+    }
+
+    return rb_call_super(argc, argv);
+}
+
+/*
+ *  call-seq:
+ *    minmax -> array
+ *    minmax { |a, b| block } -> array
+ *
+ *  Returns a two element array with the minimum and the maximum
+ *  element of +self+, or <tt>[nil, nil]</tt> if the set is empty.
+ *  The result is cached: repeated calls without intervening mutation
+ *  are O(1).  With a block, the semantics are identical to
+ *  Enumerable#minmax.
+ *
+ *    Set[2, 9, 1].minmax # => [1, 9]
+ */
+static VALUE
+set_i_minmax(int argc, VALUE *argv, VALUE set)
+{
+    struct set_object *sobj;
+    TypedData_Get_Struct(set, struct set_object, &set_data_type, sobj);
+
+    if (argc == 0 && !rb_block_given_p()) {
+        if (sobj->min_valid && sobj->max_valid) {
+            return rb_assoc_new(sobj->min, sobj->max);
+        }
+        struct set_bound_scan scan = set_bounds_update(set);
+        if (scan.empty) {
+            return rb_assoc_new(Qnil, Qnil);
+        }
+        return rb_assoc_new(scan.min, scan.max);
+    }
+
+    return rb_call_super(argc, argv);
+}
+
 static int
 set_table_insert_wb(set_table *tab, VALUE set, VALUE key)
 {
@@ -386,7 +632,10 @@ set_table_insert_wb(set_table *tab, VALUE set, VALUE key)
         key = rb_hash_key_str(key);
     }
     int ret = set_insert(tab, (st_data_t)key);
-    if (ret == 0) RB_OBJ_WRITTEN(set, Qundef, key);
+    if (ret == 0) {
+        RB_OBJ_WRITTEN(set, Qundef, key);
+        set_bound_on_insert(set, key);
+    }
     return ret;
 }
 
@@ -403,6 +652,10 @@ set_alloc_with_size_and_type(VALUE klass, st_index_t size, const struct st_hash_
     struct set_object *sobj;
 
     set = TypedData_Make_Struct(klass, struct set_object, &set_data_type, sobj);
+    sobj->min = Qnil;
+    sobj->max = Qnil;
+    sobj->min_valid = 0;
+    sobj->max_valid = 0;
     set_init_table_with_size(&sobj->table, type, size);
 
     return set;
@@ -598,6 +851,19 @@ set_i_initialize_copy(VALUE set, VALUE other)
     set_table *other_table = RSET_TABLE(other);
     set_free_embedded_table(&sobj->table);
     set_copy(&sobj->table, other_table);
+    if (rb_obj_is_kind_of(other, rb_cSet)) {
+        /* The copied table contains the same elements, so the bounds
+           of the source set (when valid) are still valid here. */
+        struct set_object *osobj;
+        TypedData_Get_Struct(other, struct set_object, &set_data_type, osobj);
+        sobj->min = osobj->min;
+        sobj->max = osobj->max;
+        sobj->min_valid = osobj->min_valid;
+        sobj->max_valid = osobj->max_valid;
+    }
+    else {
+        set_bound_invalidate(sobj);
+    }
     RB_GC_GUARD(other);
     rb_gc_writebarrier_remember(set);
 
@@ -857,6 +1123,7 @@ set_i_delete(VALUE set, VALUE item)
     rb_check_frozen(set);
     if (set_table_delete(RSET_TABLE(set), &item_data)) {
         set_compact_after_delete(set);
+        set_bounds_revalidate(set);
     }
     return set;
 }
@@ -880,6 +1147,7 @@ set_i_delete_p(VALUE set, VALUE item)
     rb_check_frozen(set);
     if (set_table_delete(RSET_TABLE(set), &item_data)) {
         set_compact_after_delete(set);
+        set_bounds_revalidate(set);
         return set;
     }
     return Qnil;
@@ -915,6 +1183,7 @@ set_i_delete_if(VALUE set)
     rb_check_frozen(set);
     set_iter(set, set_delete_if_i, 0);
     set_compact_after_delete(set);
+    set_bounds_revalidate(set);
     return set;
 }
 
@@ -947,6 +1216,7 @@ set_i_reject(VALUE set)
     if (n == set_table_size(table)) return Qnil;
 
     set_compact_after_delete(set);
+    set_bounds_revalidate(set);
     return set;
 }
 
@@ -1162,6 +1432,7 @@ set_i_clear(VALUE set)
         set_table_clear(RSET_TABLE(set));
         set_compact_after_delete(set);
     }
+    set_bounds_revalidate(set);
     return set;
 }
 
@@ -1385,6 +1656,7 @@ set_reset_table_with_type(VALUE set, const struct st_hash_type *type)
     else {
         sobj->table.type = type;
     }
+    set_bounds_revalidate(set);
 
     return set;
 }
@@ -1533,6 +1805,7 @@ set_i_xor(VALUE set, VALUE other)
         set_iter(tmp, set_xor_i, (st_data_t)new_set);
     }
     set_compact_after_delete(set);
+    set_bounds_revalidate(new_set);
 
     return new_set;
 }
@@ -1587,6 +1860,7 @@ set_remove_enum_from(VALUE set, VALUE arg)
         rb_block_call(arg, enum_method_id(arg), 0, 0, set_remove_block, set);
     }
     set_compact_after_delete(set);
+    set_bounds_revalidate(set);
 }
 
 /*
@@ -1735,6 +2009,7 @@ set_i_keep_if(VALUE set)
 
     set_iter(set, set_keep_if_i, (st_data_t)RSET_TABLE(set));
     set_compact_after_delete(set);
+    set_bounds_revalidate(set);
 
     return set;
 }
@@ -1765,6 +2040,7 @@ set_i_select(VALUE set)
     size_t n = set_table_size(table);
     set_iter(set, set_keep_if_i, (st_data_t)table);
     set_compact_after_delete(set);
+    set_bounds_revalidate(set);
 
     return (n == set_table_size(table)) ? Qnil : set;
 }
@@ -1801,6 +2077,7 @@ set_i_replace(VALUE set, VALUE other)
         set_merge_enum_into(set, other);
     }
     set_compact_after_delete(set);
+    set_bounds_revalidate(set);
 
     return set;
 }
@@ -2345,6 +2622,7 @@ rb_set_add_no_check(VALUE set, VALUE element)
 {
     if (set_insert(RSET_TABLE(set), (st_data_t)element) == 0) {
         RB_OBJ_WRITTEN(set, Qundef, element);
+        set_bound_on_insert(set, element);
         return true;
     }
     return false;
@@ -2354,7 +2632,11 @@ bool
 rb_set_delete_no_check(VALUE set, VALUE element)
 {
     st_data_t element_data = (st_data_t)element;
-    return set_table_delete(RSET_TABLE(set), &element_data) != 0;
+    bool deleted = set_table_delete(RSET_TABLE(set), &element_data) != 0;
+    if (deleted) {
+        set_bounds_revalidate(set);
+    }
+    return deleted;
 }
 
 VALUE
@@ -2621,6 +2903,7 @@ Init_Set(void)
     id_i_hash = rb_intern_const("@hash");
     id_subclass_compatible = rb_intern_const("SubclassCompatible");
     id_class_methods = rb_intern_const("ClassMethods");
+    id_cmp = rb_intern_const("<=>");
     id_set_iter_lev = rb_make_internal_id();
 
     rb_define_alloc_func(rb_cSet, set_s_alloc);
@@ -2668,6 +2951,9 @@ Init_Set(void)
     rb_define_method(rb_cSet, "join", set_i_join, -1);
     rb_define_method(rb_cSet, "keep_if", set_i_keep_if, 0);
     rb_define_method(rb_cSet, "merge", set_i_merge, -1);
+    rb_define_method(rb_cSet, "max", set_i_max, -1);
+    rb_define_method(rb_cSet, "min", set_i_min, -1);
+    rb_define_method(rb_cSet, "minmax", set_i_minmax, -1);
     rb_define_method(rb_cSet, "proper_subset?", set_i_proper_subset, 1);
     rb_define_alias(rb_cSet, "<", "proper_subset?");
     rb_define_method(rb_cSet, "proper_superset?", set_i_proper_superset, 1);
