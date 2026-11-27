@@ -45,15 +45,128 @@ escaped_length(VALUE str)
     return len * HTML_ESCAPE_MAX_LEN;
 }
 
+/*
+ * CGI.escapeHTML always runs a byte-at-a-time table loop over the
+ * whole string into a scratch buffer up to 6x the source size, and
+ * throws that buffer away to duplicate the source whenever no
+ * character needed escaping.  Plain-text payloads (the common case
+ * for large strings) therefore pay a full scalar copy for a plain
+ * dup.
+ *
+ * For long strings, probe for the five escape characters in a single
+ * SIMD pass first and duplicate the source directly when none is
+ * present, the way php-src's htmlspecialchars() fast path does.  The
+ * probe touches each byte exactly once, so the cost when the string
+ * does contain escape characters stays well below the table loop it
+ * precedes.
+ */
+#define HTML_ESCAPE_MEMCHR_MIN_LEN 128
+
+/* Returns true if [p, p+len) contains an HTML escape character. */
+static int
+html_escape_scan_plain(const unsigned char *p, size_t len)
+{
+    static const unsigned char needles[5] = { '\'', '&', '"', '<', '>' };
+    size_t i, j;
+    for (i = 0; i < len; i++) {
+        for (j = 0; j < 5; j++) {
+            if (p[i] == needles[j]) return 1;
+        }
+    }
+    return 0;
+}
+
+#if defined(__SSE2__)
+# include <emmintrin.h>
+#endif
+
+#if defined(__AVX2__)
+# include <immintrin.h>
+static int
+html_escape_scan(const unsigned char *p, size_t len)
+{
+    const __m256i sq = _mm256_set1_epi8((char)'\'');
+    const __m256i am = _mm256_set1_epi8((char)'&');
+    const __m256i qu = _mm256_set1_epi8((char)'"');
+    const __m256i lt = _mm256_set1_epi8((char)'<');
+    const __m256i gt = _mm256_set1_epi8((char)'>');
+    if (len < 32) return html_escape_scan_plain(p, len);
+    while (len >= 32) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)p);
+        __m256i m = _mm256_or_si256
+            (_mm256_or_si256(_mm256_cmpeq_epi8(v, sq), _mm256_cmpeq_epi8(v, am)),
+             _mm256_or_si256(_mm256_or_si256(_mm256_cmpeq_epi8(v, qu),
+                                             _mm256_cmpeq_epi8(v, lt)),
+                             _mm256_cmpeq_epi8(v, gt)));
+        if (!_mm256_testz_si256(m, m)) return 1;
+        p += 32;
+        len -= 32;
+    }
+    return html_escape_scan_plain(p, len); /* short tail, at most 31 bytes */
+}
+#elif defined(__SSE2__)
+html_escape_scan(const unsigned char *p, size_t len)
+{
+    const __m128i sq = _mm_set1_epi8((int)'\'');
+    const __m128i am = _mm_set1_epi8((int)'&');
+    const __m128i qu = _mm_set1_epi8((int)'"');
+    const __m128i lt = _mm_set1_epi8((int)'<');
+    const __m128i gt = _mm_set1_epi8((int)'>');
+    if (len < 16) return html_escape_scan_plain(p, len);
+    while (len >= 16) {
+        __m128i v = _mm_loadu_si128((const __m128i *)p);
+        __m128i m = _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(v, sq), _mm_cmpeq_epi8(v, am)),
+                                 _mm_or_si128(_mm_cmpeq_epi8(v, qu),
+                                              _mm_cmpeq_epi8(v, lt)));
+        m = _mm_or_si128(m, _mm_cmpeq_epi8(v, gt));
+        if (_mm_movemask_epi8(m)) return 1;
+        p += 16;
+        len -= 16;
+    }
+    return html_escape_scan_plain(p, len); /* short tail, at most 15 bytes */
+}
+#elif defined(__ARM_NEON)
+# include <arm_neon.h>
+static int
+html_escape_scan(const unsigned char *p, size_t len)
+{
+    const uint8x16_t s0 = vdupq_n_u8((uint8_t)'\'');
+    const uint8x16_t s1 = vdupq_n_u8((uint8_t)'&');
+    const uint8x16_t s2 = vdupq_n_u8((uint8_t)'"');
+    const uint8x16_t s3 = vdupq_n_u8((uint8_t)'<');
+    const uint8x16_t s4 = vdupq_n_u8((uint8_t)'>');
+    if (len < 16) return html_escape_scan_plain(p, len);
+    while (len >= 16) {
+        uint8x16_t v = vld1q_u8(p);
+        uint8x16_t m = vorrq_u8(vorrq_u8(vceqq_u8(v, s0), vceqq_u8(v, s1)),
+                                vorrq_u8(vorrq_u8(vceqq_u8(v, s2), vceqq_u8(v, s3)),
+                                         vceqq_u8(v, s4)));
+        uint64x2_t u = vreinterpretq_u64_u8(m);
+        if (vgetq_lane_u64(u, 0) | vgetq_lane_u64(u, 1)) return 1;
+        p += 16;
+        len -= 16;
+    }
+    return html_escape_scan_plain(p, len);
+}
+#else
+# define html_escape_scan html_escape_scan_plain
+#endif
+
 static VALUE
 optimized_escape_html(VALUE str)
 {
     VALUE escaped;
     VALUE vbuf;
-    char *buf = ALLOCV_N(char, vbuf, escaped_length(str));
+    char *buf;
     const char *cstr = RSTRING_PTR(str);
     const char *end = cstr + RSTRING_LEN(str);
 
+    if (end - cstr >= HTML_ESCAPE_MEMCHR_MIN_LEN) {
+        if (!html_escape_scan((const unsigned char *)cstr, (size_t)(end - cstr)))
+            return rb_str_dup(str);
+    }
+
+    buf = ALLOCV_N(char, vbuf, escaped_length(str));
     char *dest = buf;
     while (cstr < end) {
         const unsigned char c = *cstr++;
