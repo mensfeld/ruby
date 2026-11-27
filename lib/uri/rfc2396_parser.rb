@@ -315,6 +315,10 @@ module URI
     # Removes escapes from +str+.
     #
     def unescape(str, escaped = @regexp[:ESCAPED])
+      # Fast path: every escape this method can rewrite begins with a '%'
+      # byte, so a percent-free string (the common pure-ASCII path/query)
+      # decodes to itself - return a copy without scanning with the regexp.
+      return str.dup unless str.include?("%")
       enc = str.encoding
       enc = Encoding::UTF_8 if enc == Encoding::US_ASCII
       str.gsub(escaped) { [$&[1, 2]].pack('H2').force_encoding(enc) }
