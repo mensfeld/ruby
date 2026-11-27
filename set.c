@@ -1519,22 +1519,38 @@ set_xor_i(st_data_t key, st_data_t data)
 static VALUE
 set_i_xor(VALUE set, VALUE other)
 {
-    VALUE new_set = rb_obj_dup(set);
-
     if (rb_obj_is_kind_of(other, rb_cSet)) {
+        /* Fold over the smaller side: symmetric difference is commutative,
+         * so when other is larger than set, copy other (a table memcpy) and
+         * apply every element of set to it, instead of walking all of other.
+         * The guard on class and internal table type keeps the comparison
+         * semantics of the lookups identical to the old path (which always
+         * used a copy of set), so mixed identity/content sets take the old
+         * path. */
+        if (rb_obj_class(set) == rb_obj_class(other) &&
+            RSET_TABLE(set)->type == RSET_TABLE(other)->type &&
+            RSET_SIZE(other) > RSET_SIZE(set)) {
+            VALUE new_set = rb_obj_dup(other);
+            set_iter(set, set_xor_i, (st_data_t)new_set);
+            set_compact_after_delete(set);
+            return new_set;
+        }
+        VALUE new_set = rb_obj_dup(set);
         set_iter(other, set_xor_i, (st_data_t)new_set);
+        set_compact_after_delete(set);
+        return new_set;
     }
     else {
+        VALUE new_set = rb_obj_dup(set);
         VALUE tmp = set_s_alloc(rb_obj_class(new_set));
         if (RSET_COMPARE_BY_IDENTITY(new_set)) {
             set_i_compare_by_identity(tmp);
         }
         set_merge_enum_into(tmp, other);
         set_iter(tmp, set_xor_i, (st_data_t)new_set);
+        set_compact_after_delete(set);
+        return new_set;
     }
-    set_compact_after_delete(set);
-
-    return new_set;
 }
 
 /*
