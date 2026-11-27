@@ -263,6 +263,74 @@ optimized_escape(VALUE str, int plus_escape)
     }
 }
 
+/*
+ * A string with no '%' (and, for +application/x-www-form-urlencoded, no '+')
+ * cannot contain anything to decode, so optimized_unescape() can return a
+ * plain duplicate without inspecting the bytes one at a time.  Probe in one
+ * SIMD pass first: it is pure read-only scanning with no allocation, and its
+ * cost on strings that do contain escape sequences stays well below the byte
+ * loop and the ALLOCV-free append loop it precedes.
+ */
+#define UNESCAPE_PROBE_MIN_LEN 128
+
+/* Returns true if [p, p+len) contains a byte that optimized_unescape() may
+ * have to decode: '%' always, '+' only when also_plus. */
+static int
+unescape_scan_plain(const unsigned char *p, size_t len, int also_plus)
+{
+    size_t i;
+    for (i = 0; i < len; i++) {
+        unsigned char c = p[i];
+        if (c == '%' || (also_plus && c == '+'))
+            return 1;
+    }
+    return 0;
+}
+
+#if defined(__SSE2__)
+# include <emmintrin.h>
+#endif
+
+#if defined(__SSE2__)
+static int
+unescape_scan(const unsigned char *p, size_t len, int also_plus)
+{
+    const __m128i pc = _mm_set1_epi8('%');
+    const __m128i sc = _mm_set1_epi8(also_plus ? '+' : '%');
+    if (len < 16) return unescape_scan_plain(p, len, also_plus);
+    while (len >= 16) {
+        __m128i v = _mm_loadu_si128((const __m128i *)p);
+        __m128i m = _mm_or_si128(_mm_cmpeq_epi8(v, pc), _mm_cmpeq_epi8(v, sc));
+        if (_mm_movemask_epi8(m)) return 1;
+        p += 16;
+        len -= 16;
+    }
+    return unescape_scan_plain(p, len, also_plus); /* short tail, at most 15 bytes */
+}
+# define UNESCAPE_SCAN_HAS_SIMD 1
+#elif defined(__ARM_NEON)
+# include <arm_neon.h>
+static int
+unescape_scan(const unsigned char *p, size_t len, int also_plus)
+{
+    const uint8x16_t pc = vdupq_n_u8((uint8_t)'%');
+    const uint8x16_t sc = vdupq_n_u8((uint8_t)(also_plus ? '+' : '%'));
+    if (len < 16) return unescape_scan_plain(p, len, also_plus);
+    while (len >= 16) {
+        uint8x16_t v = vld1q_u8(p);
+        uint8x16_t m = vorrq_u8(vceqq_u8(v, pc), vceqq_u8(v, sc));
+        uint64x2_t u = vreinterpretq_u64_u8(m);
+        if (vgetq_lane_u64(u, 0) | vgetq_lane_u64(u, 1)) return 1;
+        p += 16;
+        len -= 16;
+    }
+    return unescape_scan_plain(p, len, also_plus);
+}
+# define UNESCAPE_SCAN_HAS_SIMD 1
+#else
+# define unescape_scan(p, l, ap) unescape_scan_plain((p), (l), (ap))
+#endif
+
 static VALUE
 optimized_unescape(VALUE str, VALUE encoding, int unescape_plus)
 {
@@ -275,7 +343,16 @@ optimized_unescape(VALUE str, VALUE encoding, int unescape_plus)
     len  = RSTRING_LEN(str);
     cstr = RSTRING_PTR(str);
 
-    for (i = 0; i < len; ++i) {
+#if defined(UNESCAPE_SCAN_HAS_SIMD)
+    /* Nothing can decode this string: skip the scan loop and duplicate it
+     * below, exactly as the loop would when it finds no escape sequence. */
+    const int clean = len >= UNESCAPE_PROBE_MIN_LEN &&
+        !unescape_scan((const unsigned char *)cstr, (size_t)len, unescape_plus);
+#else
+    const int clean = 0;
+#endif
+
+    for (i = 0; !clean && i < len; ++i) {
         char buf[1];
         const char c = cstr[i];
         int clen = 0;
