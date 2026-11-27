@@ -1306,6 +1306,20 @@ static void
 set_merge_enum_into(VALUE set, VALUE arg)
 {
     if (rb_obj_is_kind_of(arg, rb_cSet)) {
+        /* Fast path: merging into an empty Set whose table type matches
+         * (both content-based, or both compare-by-identity) can bulk-copy
+         * the source table instead of hashing and inserting every element.
+         * This mirrors the bulk-copy path initialize_copy already takes. */
+        if (RSET_EMPTY(set) &&
+            RSET_TABLE(set)->type == RSET_TABLE(arg)->type) {
+            struct set_object *sobj;
+            TypedData_Get_Struct(set, struct set_object, &set_data_type, sobj);
+            set_free_embedded_table(&sobj->table);
+            set_copy(&sobj->table, RSET_TABLE(arg));
+            rb_gc_writebarrier_remember(set);
+            RB_GC_GUARD(arg);
+            return;
+        }
         struct set_merge_args args = {
             .set = set,
             .into = RSET_TABLE(set)
