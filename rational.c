@@ -26,6 +26,7 @@
 #include "id.h"
 #include "internal.h"
 #include "internal/array.h"
+#include "internal/bits.h"
 #include "internal/complex.h"
 #include "internal/error.h"
 #include "internal/gc.h"
@@ -285,6 +286,12 @@ i_gcd(long x, long y)
     unsigned long u, v, t;
     int shift;
 
+#if SIZEOF_LONG == 8
+# define NTZ_ULONG(x) ntz_int64(x)
+#else
+# define NTZ_ULONG(x) ntz_int32(x)
+#endif
+
     if (x < 0)
         x = -x;
     if (y < 0)
@@ -297,17 +304,19 @@ i_gcd(long x, long y)
 
     u = (unsigned long)x;
     v = (unsigned long)y;
-    for (shift = 0; ((u | v) & 1) == 0; ++shift) {
-        u >>= 1;
-        v >>= 1;
+    /* common power of two: min(ctz(u), ctz(v)), one CTZ each */
+    {
+        int su = NTZ_ULONG(u);
+        int sv = NTZ_ULONG(v);
+        shift = su < sv ? su : sv;
     }
+    u >>= shift;
+    v >>= shift;
 
-    while ((u & 1) == 0)
-        u >>= 1;
+    u >>= NTZ_ULONG(u);
 
     do {
-        while ((v & 1) == 0)
-            v >>= 1;
+        v >>= NTZ_ULONG(v);
 
         if (u > v) {
             t = v;
@@ -319,6 +328,8 @@ i_gcd(long x, long y)
 
     return (long)(u << shift);
 }
+
+#undef NTZ_ULONG
 
 inline static VALUE
 f_gcd_normal(VALUE x, VALUE y)
