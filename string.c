@@ -9049,6 +9049,18 @@ rb_str_reverse(VALUE str)
 
     if (RSTRING_LEN(str) > 1) {
         if (single_byte_optimizable(str)) {
+            /* reverse 8 bytes per 64-bit bswap; the trailing middle
+             * (at most 7 bytes) finishes byte-by-byte. */
+            rb_len_t n = e - s;
+            while (n >= 8) {
+                uint64_t w;
+                memcpy(&w, s, sizeof w);
+                w = ruby_swap64(w);
+                p -= 8;
+                memcpy(p, &w, sizeof w);
+                s += 8;
+                n -= 8;
+            }
             while (s < e) {
                 *--p = *s++;
             }
