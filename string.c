@@ -12991,6 +12991,50 @@ rb_str_each_char_size(VALUE str, VALUE args, VALUE eobj)
     return rb_str_length(str);
 }
 
+/*
+ * Cache of frozen single-character ASCII strings (0x00-0x7F) for the
+ * three ASCII-compatible 8-bit superset encodings, one table per
+ * encoding.  String#each_char/#chars used to allocate a fresh String
+ * per character; single ASCII bytes are extremely common, so serve
+ * them from a lazily-filled table instead.  Entries are frozen and
+ * shared (like Integer#to_s's small cache), which changes per-char
+ * object identity between calls; all other code paths (multi-byte
+ * characters, other encodings, non-ASCII bytes) fall back to
+ * rb_str_subseq unchanged.
+ */
+#define RUBY_CHAR_CACHE_NENC 3
+#define RUBY_CHAR_CACHE_SLOTS 128
+static VALUE ruby_single_char_cache[RUBY_CHAR_CACHE_NENC][RUBY_CHAR_CACHE_SLOTS];
+static int ruby_single_char_cache_enc[RUBY_CHAR_CACHE_NENC] = { -1, -1, -1 };
+
+static inline VALUE
+str_single_char_fstring(rb_encoding *enc, unsigned char c)
+{
+    int i;
+    if (c >= RUBY_CHAR_CACHE_SLOTS) return Qundef;
+    for (i = 0; i < RUBY_CHAR_CACHE_NENC; i++) {
+        if (ruby_single_char_cache_enc[i] == rb_enc_to_index(enc)) {
+            VALUE v = ruby_single_char_cache[i][c];
+            if (!v) {
+                v = rb_enc_str_new((const char *)&c, 1, enc);
+                RB_OBJ_FREEZE_RAW(v);
+                rb_gc_register_mark_object(v);
+                ruby_single_char_cache[i][c] = v;
+            }
+            return v;
+        }
+    }
+    return Qundef;
+}
+
+static void
+str_single_char_cache_init(void)
+{
+    ruby_single_char_cache_enc[0] = rb_ascii8bit_encindex();
+    ruby_single_char_cache_enc[1] = rb_usascii_encindex();
+    ruby_single_char_cache_enc[2] = rb_utf8_encindex();
+}
+
 static VALUE
 rb_str_enumerate_chars(VALUE str, VALUE ary)
 {
@@ -13004,16 +13048,25 @@ rb_str_enumerate_chars(VALUE str, VALUE ary)
     len = RSTRING_LEN(str);
     enc = rb_enc_get(str);
 
+    if (ruby_single_char_cache_enc[2] < 0)
+        str_single_char_cache_init();
+
     if (ENC_CODERANGE_CLEAN_P(ENC_CODERANGE(str))) {
         for (i = 0; i < len; i += n) {
+            VALUE elem;
             n = rb_enc_fast_mbclen(ptr + i, ptr + len, enc);
-            ENUM_ELEM(ary, rb_str_subseq(str, i, n));
+            elem = (n == 1) ? str_single_char_fstring(enc, (unsigned char)ptr[i]) : Qundef;
+            if (elem == Qundef) elem = rb_str_subseq(str, i, n);
+            ENUM_ELEM(ary, elem);
         }
     }
     else {
         for (i = 0; i < len; i += n) {
+            VALUE elem;
             n = rb_enc_mbclen(ptr + i, ptr + len, enc);
-            ENUM_ELEM(ary, rb_str_subseq(str, i, n));
+            elem = (n == 1) ? str_single_char_fstring(enc, (unsigned char)ptr[i]) : Qundef;
+            if (elem == Qundef) elem = rb_str_subseq(str, i, n);
+            ENUM_ELEM(ary, elem);
         }
     }
     RB_GC_GUARD(str);
