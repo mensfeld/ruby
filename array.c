@@ -5746,10 +5746,35 @@ recursive_cmp(VALUE ary1, VALUE ary2, int recur)
     }
     for (i=0; i<len; i++) {
         VALUE e1 = rb_ary_elt(ary1, i), e2 = rb_ary_elt(ary2, i);
-        VALUE v = rb_funcallv(e1, id_cmp, 1, &e2);
-        if (v != INT2FIX(0)) {
-            return v;
+        VALUE v;
+        int c;
+        /* Homogeneous fixnum/float/string elements are compared
+         * inline (same fast paths and BOP flags as OPTIMIZED_CMP);
+         * everything else keeps the exact generic < <=> > > dispatch
+         * below, including its nil/non-raising behaviours. */
+        if (FIXNUM_P(e1) && FIXNUM_P(e2) && CMP_OPTIMIZABLE(INTEGER)) {
+            c = (long)e1 > (long)e2 ? 1 : (long)e1 < (long)e2 ? -1 : 0;
         }
+        else if (RB_FLOAT_TYPE_P(e1) && RB_FLOAT_TYPE_P(e2) && CMP_OPTIMIZABLE(FLOAT)) {
+            /* exact flo_cmp/rb_dbl_cmp semantics: NaN on either side
+             * yields nil (not a raise), same as Float#<=> itself. */
+            double a = RFLOAT_VALUE(e1), b = RFLOAT_VALUE(e2);
+            if (isnan(a) || isnan(b)) return Qnil;
+            c = a > b ? 1 : a < b ? -1 : 0;
+        }
+        else if (STRING_P(e1) && STRING_P(e2) && CMP_OPTIMIZABLE(STRING)) {
+            /* rb_str_cmp_m returns INT2FIX(rb_str_cmp(..)) - keep the
+             * raw (possibly non-+-1) value exactly as the funcall does. */
+            v = INT2FIX(rb_str_cmp(e1, e2));
+            if (v != INT2FIX(0)) return v;
+            continue;
+        }
+        else {
+            v = rb_funcallv(e1, id_cmp, 1, &e2);
+            if (v != INT2FIX(0)) return v;
+            continue;
+        }
+        if (c != 0) return INT2FIX(c);
     }
     return Qundef;
 }
