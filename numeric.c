@@ -1640,6 +1640,57 @@ rb_float_cmp(VALUE x, VALUE y)
 
 /*
  *  call-seq:
+ *    flt.clamp(min, max)  ->  float
+ *
+ *  See Comparable#clamp.  Fast path: when self is a non-NaN float and
+ *  both bounds are floats or small fixnums (|n| <= 2**53, exactly
+ *  representable as double), clamping is a couple of double compares.
+ *  NaN bounds and every other shape of operands keep the generic
+ *  Comparable implementation (which raises for NaN bounds), so
+ *  behaviour is identical.
+ */
+
+static VALUE
+flo_clamp(int argc, VALUE *argv, VALUE x)
+{
+    if (argc == 2) {
+        VALUE min = argv[0], max = argv[1];
+        double a = RFLOAT_VALUE(x);
+        double lo, hi;
+        if (!isnan(a)) {
+            if (FLONUM_P(min)) {
+                lo = RFLOAT_VALUE(min);
+            }
+            else if (FIXNUM_P(min) && FIX2LONG(min) >= -(1L << 53) && FIX2LONG(min) <= (1L << 53)) {
+                lo = (double)FIX2LONG(min);
+            }
+            else {
+                goto slow;
+            }
+            if (FLONUM_P(max)) {
+                hi = RFLOAT_VALUE(max);
+            }
+            else if (FIXNUM_P(max) && FIX2LONG(max) >= -(1L << 53) && FIX2LONG(max) <= (1L << 53)) {
+                hi = (double)FIX2LONG(max);
+            }
+            else {
+                goto slow;
+            }
+            if (isnan(lo) || isnan(hi)) goto slow;
+            if (lo > hi) {
+                rb_raise(rb_eArgError, "min argument must be less than or equal to max argument");
+            }
+            if (a < lo) return min;
+            if (a > hi) return max;
+            return x;
+        }
+    }
+  slow:
+    return rb_call_super(argc, argv);
+}
+
+/*
+ *  call-seq:
  *    self > other -> true or false
  *
  *  Returns whether the value of +self+ is greater than the value of +other+;
@@ -3948,6 +3999,33 @@ rb_int_pred(VALUE num)
 }
 
 #define int_pred rb_int_pred
+
+/*
+ *  call-seq:
+ *     int.clamp(min, max)  ->  integer
+ *
+ *  See Comparable#clamp.  When all operands are fixnums, clamp is a
+ *  couple of C compares; only then is the fast path taken, every other
+ *  shape (bignums, floats, Range argument, exclusive ranges) keeps the
+ *  generic Comparable implementation, so behaviour is identical.
+ */
+
+static VALUE
+int_clamp(int argc, VALUE *argv, VALUE x)
+{
+    if (argc == 2 && FIXNUM_P(x) && FIXNUM_P(argv[0]) && FIXNUM_P(argv[1])) {
+        long i = FIX2LONG(x);
+        long lo = FIX2LONG(argv[0]);
+        long hi = FIX2LONG(argv[1]);
+        if (lo > hi) {
+            rb_raise(rb_eArgError, "min argument must be less than or equal to max argument");
+        }
+        if (i < lo) return argv[0];
+        if (i > hi) return argv[1];
+        return x;
+    }
+    return rb_call_super(argc, argv);
+}
 
 VALUE
 rb_enc_uint_chr(unsigned int code, rb_encoding *enc)
@@ -6553,6 +6631,7 @@ Init_Numeric(void)
     rb_define_method(rb_cInteger, "truncate", int_truncate, -1);
     rb_define_method(rb_cInteger, "round", int_round, -1);
     rb_define_method(rb_cInteger, "<=>", rb_int_cmp, 1);
+    rb_define_method(rb_cInteger, "clamp", int_clamp, -1);
 
     rb_define_method(rb_cInteger, "+", rb_int_plus, 1);
     rb_define_method(rb_cInteger, "-", rb_int_minus, 1);
@@ -6721,6 +6800,7 @@ Init_Numeric(void)
     rb_define_method(rb_cFloat, "ceil", flo_ceil, -1);
     rb_define_method(rb_cFloat, "round", flo_round, -1);
     rb_define_method(rb_cFloat, "truncate", flo_truncate, -1);
+    rb_define_method(rb_cFloat, "clamp", flo_clamp, -1);
 
     rb_define_method(rb_cFloat, "nan?",      flo_is_nan_p, 0);
     rb_define_method(rb_cFloat, "infinite?", rb_flo_is_infinite_p, 0);
