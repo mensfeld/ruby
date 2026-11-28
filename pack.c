@@ -27,6 +27,13 @@
 
 #include "builtin.h"
 
+/* SSSE3 (pshufb) Base64 encoding for pack("m"); runtime-detected so a
+ * single x86_64 binary keeps working on pre-SSE3-era CPUs. */
+#if defined __x86_64__ && (defined __GNUC__ || defined __clang__) && !defined __OPTIMIZE_SIZE__
+# define RUBY_PACK_BASE64_SSSE3 1
+# include <immintrin.h>
+#endif
+
 /*
  * It is intentional that the condition for natstr is HAVE_TRUE_LONG_LONG
  * instead of HAVE_LONG_LONG or LONG_LONG.
@@ -954,6 +961,94 @@ static const char uu_table[] =
 static const char b64_table[] =
 "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
+#if defined RUBY_PACK_BASE64_SSSE3
+# define PACK_SSSE3_PUSH \
+    _Pragma("GCC push_options") \
+    _Pragma("GCC target(\"ssse3\")")
+# define PACK_SSSE3_POP \
+    _Pragma("GCC pop_options")
+
+/* Returns whether this CPU can execute SSSE3 (pshufb).  Result is
+ * constant per process; the plain store is a benign race. */
+static int ruby_pack_ssse3_p;
+static int ruby_pack_ssse3_checked;
+
+static int
+pack_ssse3_available(void)
+{
+    if (!ruby_pack_ssse3_checked) {
+        ruby_pack_ssse3_p = __builtin_cpu_supports("ssse3") ? 1 : 0;
+        ruby_pack_ssse3_checked = 1;
+    }
+    return ruby_pack_ssse3_p;
+}
+
+PACK_SSSE3_PUSH
+
+/*
+ *  Translate 16 six-bit indices (0..63, one per byte) to Base64
+ *  alphabet characters.  Five ranges exist: 0..25 -> 'A'+v,
+ *  26..51 -> 'a'+(v-26), 52..61 -> '0'+(v-52), 62 -> '+', 63 -> '/';
+ *  a 16-entry pshufb table supplies the per-range offsets.
+ */
+static inline __m128i
+pack_enc_translate_ssse3(const __m128i in)
+{
+    const __m128i lut = _mm_setr_epi8(
+        65,  71, -4, -4,
+        -4,  -4, -4, -4,
+        -4,  -4, -4, -4,
+        -19, -16,  0,  0);
+
+    __m128i indices = _mm_subs_epu8(in, _mm_set1_epi8(51));
+    __m128i mask = _mm_cmpgt_epi8(in, _mm_set1_epi8(25));
+    indices = _mm_sub_epi8(indices, mask);
+    return _mm_add_epi8(in, _mm_shuffle_epi8(lut, indices));
+}
+
+/*
+ *  Rearrange 12 packed source bytes (in the low 96 bits) into 16
+ *  lanes, each holding one 6-bit Base64 index in its low bits.
+ */
+static inline __m128i
+pack_enc_reshuffle_ssse3(__m128i in)
+{
+    in = _mm_shuffle_epi8(in, _mm_set_epi8(
+        10, 11,  9, 10,
+         7,  8,  6,  7,
+         4,  5,  3,  4,
+         1,  2,  0,  1));
+
+    const __m128i t0 = _mm_and_si128(in, _mm_set1_epi32(0x0FC0FC00));
+    const __m128i t1 = _mm_mulhi_epu16(t0, _mm_set1_epi32(0x04000040));
+    const __m128i t2 = _mm_and_si128(in, _mm_set1_epi32(0x003F03F0));
+    const __m128i t3 = _mm_mullo_epi16(t2, _mm_set1_epi32(0x01000010));
+    return _mm_or_si128(t1, t3);
+}
+
+/*
+ *  Encode rounds*12 input bytes into rounds*16 output bytes, 12 bytes
+ *  per SSSE3 pass.  slen must be a multiple of 12 with at least 4
+ *  further input bytes available, as every pass performs a 16-byte
+ *  load.
+ */
+static void
+pack_enc_loop_ssse3(const unsigned char *s, rb_len_t slen, char *o)
+{
+    rb_len_t rounds = slen / 12;
+    while (rounds-- > 0) {
+        __m128i str = _mm_loadu_si128((const __m128i *)s);
+        str = pack_enc_reshuffle_ssse3(str);
+        str = pack_enc_translate_ssse3(str);
+        _mm_storeu_si128((__m128i *)o, str);
+        s += 12;
+        o += 16;
+    }
+}
+
+PACK_SSSE3_POP
+#endif /* RUBY_PACK_BASE64_SSSE3 */
+
 static void
 encodes(VALUE str, const char *s0, rb_len_t len, int type, int tail_lf)
 {
@@ -971,6 +1066,26 @@ encodes(VALUE str, const char *s0, rb_len_t len, int type, int tail_lf)
     else {
         padding = '=';
     }
+
+#if defined RUBY_PACK_BASE64_SSSE3
+    if (type == 'm' && !tail_lf && len >= 48 && pack_ssse3_available()) {
+        /* Unwrapped Base64 on an SSSE3 machine: consume as many whole
+         * 12-byte groups as the input allows while keeping the 4-byte
+         * slack each 16-byte load needs, writing 16 characters per
+         * pass directly into the result buffer.  Whatever remains
+         * (at most 14 bytes plus the 0..2-byte tail) runs through the
+         * scalar loop and padding logic below unchanged. */
+        rb_len_t simd_in = (len - 4) / 12 * 12;
+        rb_len_t simd_out = simd_in / 3 * 4;
+        long old = RSTRING_LEN(str);
+        rb_str_modify_expand(str, simd_out + 8);
+        pack_enc_loop_ssse3(s, simd_in, RSTRING_PTR(str) + old);
+        rb_str_set_len(str, old + simd_out);
+        s += simd_in;
+        len -= simd_in;
+    }
+#endif
+
     while (len >= input_unit) {
         while (len >= input_unit && buff_size-i >= encoded_unit) {
             buff[i++] = trans[077 & (*s >> 2)];
