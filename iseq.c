@@ -4659,10 +4659,13 @@ succ_index_table_invert(int max_pos, struct succ_index_table *sd, int size)
     }
     for (k = 0; k < succ_size; k++) {
         for (j = 0; j < 8; j++) {
-            for (i = 0; i < 64; i++) {
-                if (sd->succ_part[k].bits[j] & (((uint64_t)1) << i)) {
-                    *p++ = k * 512 + j * 64 + i + IMMEDIATE_TABLE_SIZE;
-                }
+            /* Walk only the set bits (O(popcount)) instead of all 64
+             * bit positions per word; same ascending order. */
+            uint64_t w = sd->succ_part[k].bits[j];
+            const int base = k * 512 + j * 64 + IMMEDIATE_TABLE_SIZE;
+            while (w) {
+                *p++ = (unsigned int)(base + ntz_int64(w));
+                w &= w - 1;
             }
         }
     }
