@@ -1640,6 +1640,52 @@ rb_float_cmp(VALUE x, VALUE y)
 
 /*
  *  call-seq:
+ *    flt.between?(min, max)  ->  true or false
+ *
+ *  See Comparable#between?.  Fast path when self is a non-NaN float
+ *  and both bounds are floats or small fixnums (|n| <= 2**53, exactly
+ *  representable as double); everything else (NaN bounds, bignum
+ *  bounds, other operands) keeps the generic Comparable behaviour.
+ */
+
+static VALUE
+flo_between(VALUE x, VALUE min, VALUE max)
+{
+    double a = RFLOAT_VALUE(x);
+    double lo, hi;
+    if (!isnan(a)) {
+        if (FLONUM_P(min)) {
+            lo = RFLOAT_VALUE(min);
+        }
+        else if (FIXNUM_P(min) && FIX2LONG(min) >= -(1L << 53) && FIX2LONG(min) <= (1L << 53)) {
+            lo = (double)FIX2LONG(min);
+        }
+        else {
+            goto slow;
+        }
+        if (FLONUM_P(max)) {
+            hi = RFLOAT_VALUE(max);
+        }
+        else if (FIXNUM_P(max) && FIX2LONG(max) >= -(1L << 53) && FIX2LONG(max) <= (1L << 53)) {
+            hi = (double)FIX2LONG(max);
+        }
+        else {
+            goto slow;
+        }
+        if (isnan(lo) || isnan(hi)) goto slow;
+        return RBOOL(lo <= a && a <= hi);
+    }
+  slow:
+    {
+        VALUE args[2];
+        args[0] = min;
+        args[1] = max;
+        return rb_call_super(2, args);
+    }
+}
+
+/*
+ *  call-seq:
  *    self > other -> true or false
  *
  *  Returns whether the value of +self+ is greater than the value of +other+;
@@ -3948,6 +3994,31 @@ rb_int_pred(VALUE num)
 }
 
 #define int_pred rb_int_pred
+
+/*
+ *  call-seq:
+ *     int.between?(min, max)  ->  true or false
+ *
+ *  See Comparable#between?.  All-fixnum operands take a two-compare C
+ *  fast path; every other shape (bignums, floats, non-numerics) keeps
+ *  the generic Comparable implementation, so behaviour - including
+ *  ArgumentError for incomparable operands - is unchanged.
+ */
+
+static VALUE
+int_between(VALUE x, VALUE min, VALUE max)
+{
+    if (FIXNUM_P(x) && FIXNUM_P(min) && FIXNUM_P(max)) {
+        long i = FIX2LONG(x);
+        return RBOOL(FIX2LONG(min) <= i && i <= FIX2LONG(max));
+    }
+    else {
+        VALUE args[2];
+        args[0] = min;
+        args[1] = max;
+        return rb_call_super(2, args);
+    }
+}
 
 VALUE
 rb_enc_uint_chr(unsigned int code, rb_encoding *enc)
@@ -6553,6 +6624,7 @@ Init_Numeric(void)
     rb_define_method(rb_cInteger, "truncate", int_truncate, -1);
     rb_define_method(rb_cInteger, "round", int_round, -1);
     rb_define_method(rb_cInteger, "<=>", rb_int_cmp, 1);
+    rb_define_method(rb_cInteger, "between?", int_between, 2);
 
     rb_define_method(rb_cInteger, "+", rb_int_plus, 1);
     rb_define_method(rb_cInteger, "-", rb_int_minus, 1);
@@ -6721,6 +6793,7 @@ Init_Numeric(void)
     rb_define_method(rb_cFloat, "ceil", flo_ceil, -1);
     rb_define_method(rb_cFloat, "round", flo_round, -1);
     rb_define_method(rb_cFloat, "truncate", flo_truncate, -1);
+    rb_define_method(rb_cFloat, "between?", flo_between, 2);
 
     rb_define_method(rb_cFloat, "nan?",      flo_is_nan_p, 0);
     rb_define_method(rb_cFloat, "infinite?", rb_flo_is_infinite_p, 0);
