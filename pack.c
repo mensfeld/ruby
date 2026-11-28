@@ -332,6 +332,29 @@ pack_alignment_size(const char *p, const char *pend, VALUE fmt, size_t *alignmen
     return pack_alignment(p, pend, fmt, alignment);
 }
 
+/*
+ *  nibble value of a hex digit character, matching the historical
+ *  per-character semantics of the pack 'H'/'h' directives:
+ *  alphabetic characters take ((c & 15) + 9) & 15, everything else
+ *  simply c & 15 (so non-hex input still maps to some nibble, exactly
+ *  as before).
+ */
+static const signed char *
+hexval_table_init(void)
+{
+    static signed char table[256];
+    if (!table['9']) {
+        int i;
+        for (i = 0; i < 256; i++) {
+            if (ISALPHA(i))
+                table[i] = (signed char)((((unsigned int)i & 15) + 9) & 15);
+            else
+                table[i] = (signed char)((unsigned int)i & 15);
+        }
+    }
+    return table;
+}
+
 static VALUE
 pack_pack(rb_execution_context_t *ec, VALUE ary, VALUE fmt, VALUE buffer)
 {
@@ -524,29 +547,29 @@ pack_pack(rb_execution_context_t *ec, VALUE ary, VALUE fmt, VALUE buffer)
 
               case 'h':		/* hex string (low nibble first) */
                 {
-                    int byte = 0;
-                    rb_len_t i, j = 0;
+                    rb_len_t i, n, outlen, j = 0;
+                    char *t;
+                    long old;
 
                     if (len > plen) {
                         j = (len + 1) / 2 - (plen + 1) / 2;
                         len = plen;
                     }
-                    for (i=0; i++ < len; ptr++) {
-                        if (ISALPHA(*ptr))
-                            byte |= (((*ptr & 15) + 9) & 15) << 4;
-                        else
-                            byte |= (*ptr & 15) << 4;
-                        if (i & 1)
-                            byte >>= 4;
-                        else {
-                            char c = castchar(byte);
-                            rb_str_buf_cat(res, &c, 1);
-                            byte = 0;
+                    n = len;
+                    outlen = (n + 1) / 2;
+                    if (outlen > 0) {
+                        const signed char *hv = hexval_table_init();
+                        rb_str_modify_expand(res, outlen);
+                        old = RSTRING_LEN(res);
+                        t = RSTRING_PTR(res) + old;
+                        for (i = 0; i + 1 < n; i += 2) {
+                            t[i >> 1] = (char)((hv[(unsigned char)ptr[i + 1]] << 4) |
+                                               hv[(unsigned char)ptr[i]]);
                         }
-                    }
-                    if (len & 1) {
-                        char c = castchar(byte);
-                        rb_str_buf_cat(res, &c, 1);
+                        if (i < n) {
+                            t[i >> 1] = (char)hv[(unsigned char)ptr[i]];
+                        }
+                        rb_str_set_len(res, old + outlen);
                     }
                     len = j;
                     goto grow;
@@ -555,29 +578,29 @@ pack_pack(rb_execution_context_t *ec, VALUE ary, VALUE fmt, VALUE buffer)
 
               case 'H':		/* hex string (high nibble first) */
                 {
-                    int byte = 0;
-                    rb_len_t i, j = 0;
+                    rb_len_t i, n, outlen, j = 0;
+                    char *t;
+                    long old;
 
                     if (len > plen) {
                         j = (len + 1) / 2 - (plen + 1) / 2;
                         len = plen;
                     }
-                    for (i=0; i++ < len; ptr++) {
-                        if (ISALPHA(*ptr))
-                            byte |= ((*ptr & 15) + 9) & 15;
-                        else
-                            byte |= *ptr & 15;
-                        if (i & 1)
-                            byte <<= 4;
-                        else {
-                            char c = castchar(byte);
-                            rb_str_buf_cat(res, &c, 1);
-                            byte = 0;
+                    n = len;
+                    outlen = (n + 1) / 2;
+                    if (outlen > 0) {
+                        const signed char *hv = hexval_table_init();
+                        rb_str_modify_expand(res, outlen);
+                        old = RSTRING_LEN(res);
+                        t = RSTRING_PTR(res) + old;
+                        for (i = 0; i + 1 < n; i += 2) {
+                            t[i >> 1] = (char)((hv[(unsigned char)ptr[i]] << 4) |
+                                               hv[(unsigned char)ptr[i + 1]]);
                         }
-                    }
-                    if (len & 1) {
-                        char c = castchar(byte);
-                        rb_str_buf_cat(res, &c, 1);
+                        if (i < n) {
+                            t[i >> 1] = (char)(hv[(unsigned char)ptr[i]] << 4);
+                        }
+                        rb_str_set_len(res, old + outlen);
                     }
                     len = j;
                     goto grow;
