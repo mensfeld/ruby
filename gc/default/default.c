@@ -5282,18 +5282,31 @@ gc_sweep_plane(rb_objspace_t *objspace, rb_heap_t *heap, uintptr_t p, bits_t bit
     struct heap_page *sweep_page = ctx->page;
     short slot_size = sweep_page->slot_size;
 
-    do {
+    while (bitset) {
         VALUE vp = (VALUE)p;
         GC_ASSERT(vp % sizeof(VALUE) == 0);
+        int n = 0;
 
 #if GC_SWEEP_DOWNWARDS
         /* p starts at the plane's last slot, which may lie past the end of the page. */
-        if (bitset >> (BITS_BITLENGTH - 1)) {
-            rb_asan_unpoison_object(vp, false);
+        if (!(bitset >> (BITS_BITLENGTH - 1))) {
+            /* Skip the run of zero bits in one step: the next live
+             * slot is nlz(bitset) slots down (O(popcount) instead of
+             * O(BITS_BITLENGTH) iterations per plane). */
+            n = nlz_int64((uint64_t)bitset);
+            p -= (uintptr_t)n * slot_size;
+            bitset <<= n;
+            continue;
+        }
 #else
-        rb_asan_unpoison_object(vp, false);
-        if (bitset & 1) {
+        if (!(bitset & 1)) {
+            n = ntz_int64((uint64_t)bitset);
+            p += (uintptr_t)n * slot_size;
+            bitset >>= n;
+            continue;
+        }
 #endif
+        {
             switch (BUILTIN_TYPE(vp)) {
               case T_MOVED:
                 if (objspace->flags.during_compacting) {
@@ -5392,7 +5405,7 @@ gc_sweep_plane(rb_objspace_t *objspace, rb_heap_t *heap, uintptr_t p, bits_t bit
         p += slot_size;
         bitset >>= 1;
 #endif
-    } while (bitset);
+    }
 }
 
 static inline void
@@ -6096,10 +6109,12 @@ rb_gc_impl_location(void *objspace_ptr, VALUE value)
 static void
 invalidate_moved_plane(rb_objspace_t *objspace, struct heap_page *page, uintptr_t p, bits_t bitset)
 {
-    if (bitset) {
-        do {
-            if (bitset & 1) {
-                VALUE forwarding_object = (VALUE)p;
+    while (bitset) {
+        int n = ntz_int64((uint64_t)bitset);
+        p += (uintptr_t)n * page->slot_size;
+        bitset >>= n;
+        {
+            VALUE forwarding_object = (VALUE)p;
                 VALUE object;
 
                 if (BUILTIN_TYPE(forwarding_object) == T_MOVED) {
@@ -6122,10 +6137,9 @@ invalidate_moved_plane(rb_objspace_t *objspace, struct heap_page *page, uintptr_
                     GC_ASSERT(BUILTIN_TYPE(forwarding_object) != T_MOVED);
                     GC_ASSERT(BUILTIN_TYPE(forwarding_object) != T_NONE);
                 }
-            }
-            p += page->slot_size;
-            bitset >>= 1;
-        } while (bitset);
+        }
+        p += page->slot_size;
+        bitset >>= 1;
     }
 }
 
@@ -7727,17 +7741,18 @@ gc_remember_unprotected(rb_objspace_t *objspace, VALUE obj)
 static inline void
 gc_marks_wb_unprotected_objects_plane(rb_objspace_t *objspace, uintptr_t p, bits_t bits, short slot_size)
 {
-    if (bits) {
-        do {
-            if (bits & 1) {
-                gc_report(2, objspace, "gc_marks_wb_unprotected_objects: marked shady: %s\n", rb_obj_info((VALUE)p));
-                GC_ASSERT(RVALUE_WB_UNPROTECTED(objspace, (VALUE)p));
-                GC_ASSERT(RVALUE_MARKED(objspace, (VALUE)p));
-                gc_mark_children(objspace, (VALUE)p);
-            }
-            p += slot_size;
-            bits >>= 1;
-        } while (bits);
+    while (bits) {
+        int n = ntz_int64((uint64_t)bits);
+        p += (uintptr_t)n * slot_size;
+        bits >>= n;
+        {
+            gc_report(2, objspace, "gc_marks_wb_unprotected_objects: marked shady: %s\n", rb_obj_info((VALUE)p));
+            GC_ASSERT(RVALUE_WB_UNPROTECTED(objspace, (VALUE)p));
+            GC_ASSERT(RVALUE_MARKED(objspace, (VALUE)p));
+            gc_mark_children(objspace, (VALUE)p);
+        }
+        p += slot_size;
+        bits >>= 1;
     }
 }
 
@@ -8022,11 +8037,15 @@ gc_compact_plane(rb_objspace_t *objspace, rb_heap_t *heap, uintptr_t p, bits_t b
 {
     short slot_size = page->slot_size;
 
-    do {
+    while (bitset) {
         VALUE vp = (VALUE)p;
         GC_ASSERT(vp % sizeof(VALUE) == 0);
+        int n = ntz_int64((uint64_t)bitset);
+        p += (uintptr_t)n * slot_size;
+        vp = (VALUE)p;
+        bitset >>= n;
 
-        if (bitset & 1) {
+        {
             objspace->rcompactor.considered_count_table[BUILTIN_TYPE(vp)]++;
 
             if (gc_is_moveable_obj(objspace, vp)) {
@@ -8038,7 +8057,7 @@ gc_compact_plane(rb_objspace_t *objspace, rb_heap_t *heap, uintptr_t p, bits_t b
         }
         p += slot_size;
         bitset >>= 1;
-    } while (bitset);
+    }
 
     return true;
 }
@@ -8435,23 +8454,24 @@ rgengc_remember(rb_objspace_t *objspace, VALUE obj)
 static inline void
 rgengc_rememberset_mark_plane(rb_objspace_t *objspace, uintptr_t p, bits_t bitset, short slot_size)
 {
-    if (bitset) {
-        do {
-            if (bitset & 1) {
-                VALUE obj = (VALUE)p;
-                gc_report(2, objspace, "rgengc_rememberset_mark: mark %s\n", rb_obj_info(obj));
-                GC_ASSERT(RVALUE_UNCOLLECTIBLE(objspace, obj));
-                GC_ASSERT(RVALUE_OLD_P(objspace, obj) || RVALUE_WB_UNPROTECTED(objspace, obj));
+    while (bitset) {
+        int n = ntz_int64((uint64_t)bitset);
+        p += (uintptr_t)n * slot_size;
+        bitset >>= n;
+        {
+            VALUE obj = (VALUE)p;
+            gc_report(2, objspace, "rgengc_rememberset_mark: mark %s\n", rb_obj_info(obj));
+            GC_ASSERT(RVALUE_UNCOLLECTIBLE(objspace, obj));
+            GC_ASSERT(RVALUE_OLD_P(objspace, obj) || RVALUE_WB_UNPROTECTED(objspace, obj));
 
-                gc_mark_children(objspace, obj);
+            gc_mark_children(objspace, obj);
 
-                if (RB_FL_TEST_RAW(obj, RUBY_FL_WEAK_REFERENCE)) {
-                    rb_darray_append_without_gc(&objspace->weak_references, obj);
-                }
+            if (RB_FL_TEST_RAW(obj, RUBY_FL_WEAK_REFERENCE)) {
+                rb_darray_append_without_gc(&objspace->weak_references, obj);
             }
-            p += slot_size;
-            bitset >>= 1;
-        } while (bitset);
+        }
+        p += slot_size;
+        bitset >>= 1;
     }
 }
 
